@@ -1,0 +1,767 @@
+---
+title: "Industrial Load Simulation"
+author: "Ian Bledsoe"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  word_document: default
+knit: (
+  function(inputFile, encoding) { 
+  
+    rmarkdown::render( 
+      input       = inputFile, 
+      encoding    = encoding, 
+      output_file = paste(Sys.Date(), 'Industrial Load Sim')) })
+---
+
+<!---
+Hello World! (MIDS application Reviewers)
+This R script is a Monte-Carlo Simulation I wrote.
+It takes the most recent load forecast, which is a point forecast using a linear regression model
+Then it creates 800 random futures based on a normal distribution with mean equal to the point forecast
+and standard deviation equal to the SD of historic normalized loads.
+Also simulates a behind the meter resource (Cogen) which is covariant with one of the loads (Wauna).
+
+Please excuse the mess! =)
+-->
+
+<!---
+Tips:
+  Don't name code chunks 'setup' - reserved
+  include=false means you wont see any output
+  echo=false means you wont see code, but will see output of code?
+  need 1 space after # for headings/subheadings
+  
+  May fail knitting to .html?
+  worked to Word.
+  
+  Include - Display output (if any) of code in doc
+  Echo - Display code in output doc
+  Eval - code doesnt run at all
+-->
+
+
+<!-- DT (datatable) is a cool package for displaying tables in .rmd -->
+<!-- "esquisse" looks cool for GUI graphics -->
+
+# Purpose of this script is to generate loads for 800 simulated futures
+Camas, Halsey, Wauna&Cogen - wauna & cogen should be covariant.
+Used in the DPM.
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+```
+
+
+#Packages
+```{r loadpkgs, echo=FALSE, include=FALSE, warning=FALSE, message=FALSE, results='hide'}
+library(lubridate)#date manipulation library *floor_date
+library(svMisc)
+library(magrittr) #pipe operators
+library(reshape2) #pivot
+library(crayon) #allows print (text) with color
+library(gridExtra) #need this for display of lattice graphs
+library(MASS)#for mvnorm, scale
+library(marima)
+library(ggplot2)
+library(MLmetrics) #MAPE
+library(RODBC)
+library(ggpubr)
+library(grid)
+library(dplyr) #load last; plyr conflict (what abt other packages that import plyr?)
+cat("\014") #clear console
+
+result = tryCatch({
+    dev.off()
+}, error = function(error_condition) {
+  })
+rm(list=setdiff(ls(), c(""))) #remove objects
+source('\\\\itv00005\\Power\\Data_Systems\\R\\CustomFunctions.R')
+```
+
+
+```{r sql, echo=FALSE}
+channel <- odbcConnect("Superpower")
+rawload<-sqlQuery(channel, "execute Meter_Mathv2") #Slow ~20s
+loadhour<-sqlQuery(channel, "execute LAT_LoadHour_Vertical")
+outdata<-sqlQuery(channel, "execute LAT_Outages") #Slow ~30s
+#factordata<-sqlQuery(channel, "execute LAT_Load_Factors") #Slow ~15s
+raweedata<-sqlQuery(channel, "execute LAT_Energy_Efficiency") #Slow ~15s
+forecastdata<-sqlQuery(channel, "Select atable.*, LH as [Hrs]
+                                  from
+                                  (
+                                  select * from Load_Forecast
+                                  where Run_Date = (select Max(Run_Date) from Load_Forecast)
+                                  )atable
+                                  left join
+                                  (
+                                  select cast(DATEADD(month, DATEDIFF(month, 0, [Timestamp]), 0)AS date) as Dt
+                                  		,Load_Hour
+                                  		,count(Load_Hour) as LH	
+                                  from Workday_Timeseries
+                                  group by cast(DATEADD(month, DATEDIFF(month, 0, [Timestamp]), 0)AS date)
+                                  			,Load_Hour
+                                  )btable
+                                  on atable.MonthYear=btable.Dt
+                                  and atable.Load_Hour=btable.Load_Hour")
+close(channel); rm(channel)
+```
+
+```{r clean, echo=FALSE}
+
+loaddata<- rawload %>%
+                #replace(., is.na(.), 0) %>%
+                group_by(Dy=as.Date(floor_date(Timestamp, "month"))) %>%
+                summarise(Wauna=mean(na.omit(Wauna)),
+                          Cogen=mean(na.omit(WaunaCoGen)),
+                          Halsey=mean(na.omit(Halsey)),
+                          Camas=mean(na.omit(Camas)))
+loaddata<-loaddata[loaddata$Dy>="2004-01-01" & loaddata$Dy < as.Date(cut(Sys.Date(), "month")),]
+loaddata$Month<-month(loaddata$Dy)
+loaddata$timeseq<-0:(nrow(loaddata)-1)
+loaddata$revtimeseq<-rev(0:(nrow(loaddata)-1))
+#EE Data
+raweedata$Month_Claimed<-as.Date(raweedata$Month_Claimed)
+mframe<-data.frame("MonYr"=as.Date(seq(ymd(min(raweedata$Month_Claimed)),ymd(floor_date(Sys.Date(), "month") - months(1)), by = 'months')))
+eedata<-merge(mframe, raweedata, by.x="MonYr", by.y="Month_Claimed", all=T)
+eedata[is.na(eedata)]<-0
+eedata<-merge(eedata, loaddata, by.x="MonYr", by.y="Dy", all.x=T)
+eedata$wauna.ee.pct<-eedata$wauna.ee/eedata$Wauna
+eedata$halsey.ee.pct<-eedata$halsey.ee/eedata$Halsey
+##eedata<-eedata[eedata$MonYr>='2004-01-01' & eedata$MonYr<'2019-01-01' ,]
+eedata$cumWauna<-as.numeric(rev(cumsum(rev(eedata$wauna.ee))))
+eedata$cumHalsey<-as.numeric(rev(cumsum(rev(eedata$halsey.ee))))
+loaddata<-merge(loaddata, eedata[,c(1, 15, 16)], by.x="Dy", by.y="MonYr", all.x=T)
+#Out Data
+outdata$Dy<-as.Date(outdata$Dy)
+outdata <- outdata %>%
+              group_by(Dy) %>%
+              summarise(WaunaOut=sum(WaunaOut),
+                        HalseyOut=sum(HalseyOut),
+                        CamasOut=sum(CamasOut),
+                        CogenOut=sum(CogenOut))
+loaddata<-merge(loaddata, outdata, by.x="Dy", by.y="Dy", all.x=T)
+#ForecastData
+
+forecastdata<-forecastdata[,c(1,4,6,8)] %>%
+                  group_by(MonthYear,Variable) %>%
+                  summarise(MWh=sum(Quantity),
+                            Hrs=sum(Hrs)) %>%
+                  mutate(aMW=MWh/Hrs,
+                         MWh=NULL,
+                         Hrs=NULL) %>%
+                  dcast(MonthYear ~ Variable, value.var="aMW")
+forecastdata$MonthYear<-as.Date(forecastdata$MonthYear)
+```
+
+
+#Outage normalization
+```{r outage_norm2, echo=FALSE, include=TRUE}
+waunaoutmod<-lm(Wauna~WaunaOut, data=loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),])
+loaddata$Wauna.norm1<-loaddata$Wauna
+loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),]$Wauna.norm1<-as.numeric(loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),]$Wauna - (waunaoutmod$coefficients[2] * loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),]$WaunaOut))
+
+halseyoutmod<-lm(Halsey~HalseyOut, data=loaddata)
+loaddata$Halsey.norm1<-loaddata$Halsey - (halseyoutmod$coefficients[2] * loaddata$HalseyOut)
+
+cogenoutmod<-lm(Cogen~CogenOut, data=loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),])
+loaddata$Cogen.norm1<-loaddata$Cogen
+loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),]$Cogen.norm1<-as.numeric(loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),]$Cogen - (cogenoutmod$coefficients[2] * loaddata[!(loaddata$Month == 5 & loaddata$Dy > '2010-01-01'),]$CogenOut))
+
+
+```
+
+#Remove EE
+```{r remove_ee, echo=FALSE, include=FALSE}
+#Scale EE to Month
+ratioframe <- loaddata %>%
+              group_by(Month=month(Dy)) %>%
+              summarise(WaunaRatio=mean(Wauna),
+                        HalseyRatio=mean(Halsey))
+ratioframe$WaunaRatio<-ratioframe$WaunaRatio/mean(loaddata$Wauna)
+ratioframe$HalseyRatio<-ratioframe$HalseyRatio/mean(loaddata$Halsey)
+loaddata<-merge(loaddata, ratioframe, by.x="Month", by.y="Month", all.x=T)
+loaddata<-loaddata[order(loaddata$Dy),]
+loaddata$cumWauna<-loaddata$cumWauna * loaddata$WaunaRatio
+loaddata$cumHalsey<-loaddata$cumHalsey * loaddata$HalseyRatio
+#Remove historic EE
+loaddata$Wauna.norm2<-loaddata$Wauna.norm - loaddata$cumWauna
+loaddata$Halsey.norm2<-loaddata$Halsey.norm - loaddata$cumHalsey
+loaddata<-loaddata[order(loaddata$Dy),]
+```
+
+#Detrending
+```{r detrend, echo=TRUE, include=FALSE}
+#Halsey
+halseymod<-lm(Halsey.norm2~timeseq, data=loaddata, na.action = na.omit)
+loaddata$Halsey.norm3<-na.omit(loaddata$Halsey.norm2) + (halseymod$coefficients[2] * na.omit(loaddata$revtimeseq))
+
+#Detrend Wauna
+waunamod<-lm(Wauna.norm2~timeseq, data=loaddata)
+loaddata$Wauna.norm3<-loaddata$Wauna.norm2 + (waunamod$coefficients[2] * loaddata$revtimeseq)
+
+#Detrend Cogen
+cogenmod<-lm(Cogen.norm1~timeseq, data=loaddata)
+loaddata$Cogen.norm3<-loaddata$Cogen.norm1 + (cogenmod$coefficients[2] * loaddata$revtimeseq)
+
+#Detrend Camas
+camasframe<-loaddata[loaddata$Dy<"2018-09-01",]
+camasframe<-camasframe[complete.cases(camasframe[, 6]),]
+camasframe$timeseq<-seq(0,NROW(camasframe)-1)
+camasframe$revtimeseq<-rev(seq(0,NROW(camasframe)-1))
+camasmod<-lm(Camas~timeseq, data=camasframe, na.action=na.omit)
+loaddata$Camas.norm3<-loaddata$Camas
+loaddata[loaddata$Dy<"2018-09-01" & complete.cases(loaddata[, 6]),]$Camas.norm3<-camasframe$Camas + (camasmod$coefficients[2] * camasframe$revtimeseq)
+
+loaddata[loaddata$Cogen.norm3<0,]$Cogen.norm3<-0
+```
+
+#Simulation
+```{r simulation, echo=F}
+
+sdincrease<-1.35
+
+loaddata<-loaddata[order(loaddata$Dy),]
+
+simframe<-data.frame("MonYr"=rep(as.Date(seq(ymd("2019-01-01"),ymd("2040-12-1"), by = 'months')), times=800),
+                     "Run"=rep(1:800, each=(12*22)),
+                     "Month"=month(rep(as.Date(seq(ymd("2019-01-01"),ymd("2040-12-1"), by = 'months')), times=800)),
+                     "Wauna"= NA,
+                     "Cogen"= NA,
+                     "Halsey"= NA,
+                     "Camas"= NA)
+
+#Sim Halsey
+for (yr_no in 2019:2040){
+    for (mon_no in 1:12){
+      simframe[simframe$Month==mon_no & year(simframe$MonYr)==yr_no,]$Halsey<-rnorm(NROW(simframe[month(simframe$MonYr)==mon_no & year(simframe$MonYr)==yr_no,]),mean=mean(forecastdata[month(forecastdata$MonthYear)==mon_no & year(forecastdata$MonthYear)==yr_no,]$Halsey),
+                                                      sd=sd(loaddata$Halsey.norm3)*sdincrease)
+    }
+}
+
+#sim camas, build monthly distribution from hourly data...? help deal with short dataset?
+#SD is not month-specific, since you need at least two data.
+for (yr_no in 2019:2040){
+    for (mon_no in 1:12){
+      simframe[simframe$Month==mon_no & year(simframe$MonYr)==yr_no,]$Camas<-rnorm(NROW(simframe[month(simframe$MonYr)==mon_no & year(simframe$MonYr)==yr_no,]), mean= mean(forecastdata[month(forecastdata$MonthYear)==mon_no & year(forecastdata$MonthYear)==yr_no,]$Camas), 
+sd=sd(na.omit(loaddata[loaddata$Dy>="2018-09-01",]$Camas.norm3))*sdincrease) #works, but extremes not extreme enough
+#sd=sd(na.omit(loaddata[loaddata$Month==mon_no,]$Camas.norm3))) #too much (impossible) variation...
+    }
+}
+
+#Sim covariant Wauna & Cogen
+for (yr_no in 2019:2040){
+  for (mon_no in 1:12){
+    covmx<-cov(loaddata[loaddata$Month==mon_no,c("Wauna.norm3", "Cogen.norm3")])
+    covmx<-covmx*sdincrease
+    means<-c(mean(forecastdata[month(forecastdata$MonthYear)==mon_no & year(forecastdata$MonthYear)==yr_no,]$Wauna)
+            ,mean(loaddata[loaddata$Month==mon_no & yr_no%%3==year(loaddata$Dy)%%3,]$Cogen.norm3)) # 
+    draws <- mvrnorm(NROW(simframe[month(simframe$MonYr)==mon_no & year(simframe$MonYr)==yr_no,]),
+                   mu=means,
+                  Sigma=covmx)
+  simframe[simframe$Month==mon_no & year(simframe$MonYr)==yr_no,]$Wauna<-draws[,"Wauna.norm3"]
+  simframe[simframe$Month==mon_no & year(simframe$MonYr)==yr_no,]$Cogen<-draws[,"Cogen.norm3"]
+  }
+}
+
+simframe[simframe$Cogen <0,]$Cogen <- 0
+simframe$Year<-year(simframe$MonYr)
+```
+
+#Summary Frames
+```{r create_megaframe, echo=FALSE}
+
+loaddata$Type<-"Actual"
+loaddata$Run<-NA
+simframe$Type<-"Simulated"
+forecastdata$Type<-"Forecast"
+forecastdata$Run<-NA
+forecastdata$Cogen<-NA
+
+
+#Does this work, or does it blend actual, sim & forecast????
+megaframe<-as.data.frame(mapply(c, loaddata[, c("Dy", "Halsey.norm3", "Wauna.norm3", "Cogen.norm3", "Camas.norm3", "Type", "Run")],
+                                   simframe[,c("MonYr", "Halsey", "Wauna", "Cogen", "Camas", "Type", "Run")],
+                                    forecastdata[,c("MonthYear", "Halsey", "Wauna", "Cogen", "Camas", "Type", "Run")], SIMPLIFY = F))
+
+megaframe<-megaframe %>% 
+            rename(
+              Halsey=Halsey.norm3,
+              Wauna=Wauna.norm3,
+              Cogen=Cogen.norm3,
+              Camas=Camas.norm3
+              )
+
+megaframe$Year<-year(megaframe$Dy)
+megaframe[is.na(megaframe$Camas),]$Camas <- mean(na.omit(forecastdata$Camas))
+megaframe$Total<-megaframe$Halsey+megaframe$Wauna+megaframe$Camas
+megaframe$TotalexCamas<-megaframe$Halsey+megaframe$Wauna
+
+yrframe<-megaframe %>%
+        group_by(Year=year(Dy),
+                 Run=Run,
+                 Type=Type) %>%
+        summarise(Halsey=weighted.mean(Halsey,days_in_month(Dy)),
+                  Wauna=weighted.mean(Wauna,days_in_month(Dy)),
+                  Cogen=weighted.mean(Cogen,days_in_month(Dy)),
+                  Camas=weighted.mean(Camas,days_in_month(Dy)))
+
+
+yrframe$Total<- yrframe$Halsey+yrframe$Wauna+yrframe$Camas
+yrframe$TotalexCamas<- yrframe$Halsey+yrframe$Wauna
+
+
+
+```
+
+# Histograms!
+
+```{r plot6, echo=FALSE}
+
+#plot monthly histos old vs new. facet!
+
+#Wauna
+ggplot(megaframe, aes(Wauna)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Wauna Monthly Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=seq(0, max(na.omit(megaframe$Wauna)), 1))
+
+#Halsey
+ggplot(megaframe, aes(Halsey)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Halsey Monthly Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=seq(0, max(na.omit(megaframe$Halsey)), 1))
+
+#Camas
+ggplot(megaframe, aes(Camas)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Camas Monthly Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=seq(0, max(na.omit(megaframe$Camas)), 1))
+
+#Cogen
+ggplot(megaframe[!is.na(megaframe$Cogen),], aes(Cogen)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Cogen Monthly Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=seq(0, max(na.omit(megaframe$Cogen)), 2))
+
+
+
+
+
+
+
+probs <- c(0.05, 0.95)
+xlims<- c(80, 116)
+
+######################################
+
+#monthly actual dist setup
+actmonframe<- megaframe[megaframe$Type=="Actual",]
+actmondens<- density(actmonframe$TotalexCamas) #########excludes camas
+actmondensframe<-data.frame(x=actmondens$x, y=actmondens$y)
+actmonquantiles <- quantile(actmonframe$TotalexCamas, prob=probs) #########excludes camas
+actmondensframe$quant <- factor(findInterval(actmondensframe$x,actmonquantiles))
+
+#monthly sim dist setup (2019)
+simmonframe<- megaframe[megaframe$Type=="Simulated" & megaframe$Year==2019,]
+simmondens<- density(simmonframe$TotalexCamas) #########excludes camas
+simmondensframe<-data.frame(x=simmondens$x, y=simmondens$y)
+simmonquantiles <- quantile(simmonframe$TotalexCamas, prob=probs) #########excludes camas
+simmondensframe$quant <- factor(findInterval(simmondensframe$x,simmonquantiles))
+
+
+cat(blue("Total Monthly Quantiles and 90% bands: "));cat("\n")
+cat("Sim p5: ", simmonquantiles[[1]], "\n")
+cat("Sim p95: ", simmonquantiles[[2]], "\n")
+cat("Sim Spread: ", simmonquantiles[[2]]-simmonquantiles[[1]], "\n\n")
+
+cat("Actual p5: ", actmonquantiles[[1]], "\n")
+cat("Actual p95: ", actmonquantiles[[2]], "\n")
+cat("Actual Spread: ", actmonquantiles[[2]]-actmonquantiles[[1]], "\n\n")
+
+simmondist <- ggplot(simmondensframe, aes(x,y)) +
+            geom_line() +
+            geom_ribbon(aes(ymin=0, ymax=y, fill=quant)) +
+            scale_x_continuous(breaks=all_int_breaks(yrframe$Total), limits=xlims) +
+            scale_fill_brewer(guide="none") +
+            ggtitle("Simulated Theoretical Monthly Distribution (2019)")
+
+actmondist <- ggplot(actmondensframe, aes(x,y)) +
+            geom_line() +
+            geom_ribbon(aes(ymin=0, ymax=y, fill=quant)) +
+            scale_x_continuous(breaks=all_int_breaks(yrframe$Total), limits=xlims) +
+            scale_fill_brewer(guide="none") +
+            ggtitle("Actual Theoretical Monthly Distribution")
+
+
+
+ggarrange(actmondist,simmondist, align = "hv", ncol = 1, nrow = 4)
+
+```
+
+
+```{r plot7, echo=FALSE}
+#plot annual histos old vs new. facet!
+
+#Wauna
+ggplot(yrframe, aes(Wauna)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Wauna Annual Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Wauna))
+
+#Halsey
+ggplot(yrframe, aes(Halsey)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Halsey Annual Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Halsey))
+
+#Camas
+ggplot(yrframe, aes(Camas)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Camas Annual Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(na.omit(yrframe$Camas)))
+
+#Cogen
+ggplot(yrframe[!is.na(yrframe$Cogen),], aes(Cogen)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Cogen Annual Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(na.omit(yrframe$Cogen)))
+
+
+#Total
+ggplot(yrframe, aes(Total)) +
+    geom_histogram(aes(fill=Type),show.legend=FALSE, binwidth=1) +
+    facet_grid(Type~., scales="free") +
+    ggtitle("Total Annual Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Total))
+
+#annual histograms by year
+ggplot(yrframe[yrframe$Type=="Simulated",], aes(Total)) +
+    geom_histogram(aes(fill=Year),binwidth=1) +
+    facet_grid(Year~., scales="free") +
+    ggtitle("Total Annual Sim Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Total))
+
+
+
+
+#annual histograms by year
+ggplot(yrframe[yrframe$Type=="Actual",], aes(Total)) +
+    geom_histogram(aes(fill=Year),binwidth=1) +
+    facet_grid(Year~., scales="free") +
+    ggtitle("Total Annual Actual Histograms") +
+    scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Total))
+
+
+```
+
+
+#Probability Distributions
+
+```{r percentile_yr}
+
+probs <- c(0.05, 0.95)
+xlims<- c(95, 116)
+
+######################################
+
+#annual actual hist setup
+actyrframe<- yrframe[yrframe$Type=="Actual",]
+actdens<- density(actyrframe$Total)
+actdensframe<-data.frame(x=actdens$x, y=actdens$y)
+actquantiles <- quantile(actyrframe$Total, prob=probs)
+actdensframe$quant <- factor(findInterval(actdensframe$x,actquantiles))
+
+#annual sim hist setup (2019)
+simyrframe<- yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]
+simdens<- density(simyrframe$Total)
+simdensframe<-data.frame(x=simdens$x, y=simdens$y)
+simquantiles <- quantile(simyrframe$Total, prob=probs)
+simdensframe$quant <- factor(findInterval(simdensframe$x,simquantiles))
+
+#######################################
+
+#annual actual hist setup (No Camas)
+actdens2<- density(actyrframe$TotalexCamas)
+actdensframe2<-data.frame(x=actdens2$x, y=actdens2$y)
+actquantiles2 <- quantile(actyrframe$TotalexCamas, prob=probs)
+
+
+#annual sim hist setup (2019) (No Camas)
+simdens2<- density(simyrframe$TotalexCamas)
+simdensframe2<-data.frame(x=simdens2$x, y=simdens2$y)
+simquantiles2 <- quantile(simyrframe$TotalexCamas, prob=probs)
+
+
+######################################
+
+simdist <- ggplot(simdensframe, aes(x,y)) +
+            geom_line() +
+            geom_ribbon(aes(ymin=0, ymax=y, fill=quant)) +
+            scale_x_continuous(breaks=all_int_breaks(yrframe$Total), limits=xlims) +
+            scale_fill_brewer(guide="none") +
+            ggtitle("Simulated Theoretical Distribution (2019)")
+
+#annual sim histogram (2020)
+simhist <- ggplot(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,], aes(Total)) +
+            geom_histogram(binwidth=1) +
+            ggtitle("Simulated Histogram (2019)") +
+            scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Total), limits=xlims)
+
+actdist <- ggplot(actdensframe, aes(x,y)) +
+            geom_line() +
+            geom_ribbon(aes(ymin=0, ymax=y, fill=quant)) +
+            scale_x_continuous(breaks=all_int_breaks(yrframe$Total), limits=xlims) +
+            scale_fill_brewer(guide="none") +
+            ggtitle("Actual Normalized Theoretical Distribution")
+
+acthist <- ggplot(yrframe[yrframe$Type=="Actual",], aes(Total)) +
+            geom_histogram(aes(fill=Year),binwidth=1) +
+            ggtitle("Actual Normalized Histogram") +
+            scale_x_continuous(minor_breaks=NULL, breaks=all_int_breaks(yrframe$Total), limits=xlims)
+
+ggarrange(simdist,simhist,actdist,acthist, align = "hv", ncol = 1, nrow = 4)
+
+#Error about missing rows seems to be a lie
+```
+
+#Summary Stats
+
+```{r sum_stats}
+#plot summary stats
+
+cat(red("Hist. normalized Wauna: \n"));summary(loaddata$Wauna.norm3); cat(green("Random Wauna: \n"));summary(simframe[simframe$Year==2019,]$Wauna); cat(black("***************\n"))
+cat(red("Hist. normalized Cogen: \n"));summary(loaddata$Cogen.norm3); cat(green("Random Cogen: \n"));summary(simframe[simframe$Year==2019,]$Cogen); cat(black("***************\n"))
+cat(red("Hist. normalized Halsey: \n"));summary(loaddata$Halsey.norm3); cat(green("Random Halsey: \n"));summary(simframe[simframe$Year==2019,]$Halsey); cat(black("***************\n"))
+cat(red("Hist. normalized Camas: \n"));summary(loaddata$Camas.norm3); cat(green("Random Camas: \n"));summary(simframe[simframe$Year==2019,]$Camas); cat(black("***************\n"))
+
+
+# Makes sense for random to be lower, since they're based off
+# forecast, which is decreasing as time goes on.
+```
+
+
+```{r sum_stats2}
+cat(blue("Annual Stats\n"))
+
+cat(red("Actual.n Total Mean: ")); mean(yrframe[yrframe$Type=="Actual",]$Total)
+cat(red("Sim Total mean (2019): ")); mean(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Total); cat("\n")
+
+cat(red("Actual.n Total SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Total)
+cat(red("Sim Total SD (2019): ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Total); cat("\n")
+
+cat(red("Act.n Halsey SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Halsey)
+cat(red("Sim Halsey SD (2019): ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Halsey); cat("\n")
+
+cat(red("Act.n Wauna SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Wauna)
+cat(red("Sim Wauna SD (2019): ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Wauna); cat("\n")
+
+cat(red("Act.n Cogen SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Cogen)
+cat(red("Sim Cogen SD (2019): ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Cogen); cat("\n")
+
+cat(red("Act.n Camas SD: ")); sd(na.omit(yrframe[yrframe$Type=="Actual",]$Camas))
+cat(red("Sim Camas SD (2019): ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Camas); cat("\n")
+
+
+cat(blue("Total Annual Quantiles and 90% bands: "));cat("\n")
+cat("Sim p5: ", simquantiles[[1]], "\n")
+cat("Sim p95: ", simquantiles[[2]], "\n")
+cat("Sim Spread: ", simquantiles[[2]]-simquantiles[[1]], "\n\n")
+cat("Actual p5: ", actquantiles[[1]], "\n")
+cat("Actual Spread: ", actquantiles[[2]]-actquantiles[[1]], "\n\n")
+
+```
+
+
+```{r sum_stats2}
+cat(blue("Monthly Standard Deviations\n"))
+
+cat(red("Actual.n Total SD: ")); sd(simframe[simframe$Type=="Actual",]$Total)
+cat(red("Sim Total SD: ")); sd(simframe[simframe$Type=="Simulated" & simframe$Year==2019,]$Total); cat("\n")
+
+cat(red("Act.n Halsey SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Halsey)
+cat(red("Sim Halsey SD: ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Halsey); cat("\n")
+
+cat(red("Act.n Wauna SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Wauna)
+cat(red("Sim Wauna SD: ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Wauna); cat("\n")
+
+cat(red("Act.n Wauna SD: ")); sd(yrframe[yrframe$Type=="Actual",]$Cogen)
+cat(red("Sim Wauna SD: ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Cogen); cat("\n")
+
+cat(red("Act.n Camas SD: ")); sd(na.omit(yrframe[yrframe$Type=="Actual",]$Camas))
+cat(red("Sim Camas SD: ")); sd(yrframe[yrframe$Type=="Simulated" & yrframe$Year==2019,]$Camas); cat("\n")
+
+```
+
+# 2d Bin Plots
+
+```{r plot4, echo=FALSE}
+
+#Wauna
+ggplot(simframe, aes(MonYr, Wauna)) +
+    geom_bin2d() +
+    geom_line(data=forecastdata, aes(MonthYear, Wauna), size=1, col="red")
+    #geom_ribbon(aes(min=min(Wauna), max=max(Wauna)))
+
+#Halsey
+ggplot(simframe, aes(MonYr, Halsey)) +
+    geom_bin2d() +
+    geom_line(data=forecastdata, aes(MonthYear, Halsey), size=1, col="red")
+    #geom_ribbon(aes(min=min(Wauna), max=max(Wauna)))
+
+#Camas
+ggplot(simframe, aes(MonYr, Camas)) +
+    geom_bin2d() +
+    geom_line(data=forecastdata, aes(MonthYear, Camas), size=1, col="red")
+    
+#Cogen
+ggplot(simframe, aes(MonYr, Cogen)) +
+    geom_bin2d()
+
+```
+
+
+# Plot Outage Normalized 
+Actuals (black) & outage-normalized (red)
+```{r plot1, echo=FALSE, include=TRUE}
+lnwght=1
+#Wauna
+ggplot(loaddata, aes(Dy, Wauna)) +
+    geom_line(size=lnwght) +
+    geom_line(aes(Dy, Wauna.norm1),size=lnwght+1,col="red")
+
+#Cogen
+ggplot(loaddata, aes(Dy, Cogen)) +
+    geom_line(size=lnwght) +
+    geom_line(aes(Dy, Cogen.norm1),size=lnwght+1,col="red")
+
+#Halsey
+ggplot(loaddata[!is.na(loaddata$Halsey),], aes(Dy, Halsey)) +
+  geom_line(size=lnwght) +
+  geom_line(aes(Dy, Halsey.norm1),col="red", size=lnwght+1)
+
+#Camas
+ggplot(loaddata[!is.na(loaddata$Camas),], aes(Dy, Camas)) +
+  geom_line(size=lnwght)
+
+```
+
+
+
+# Plot EE removed
+Actuals (black), outage normalized (red), and outage normalized with ee removed (blue)
+```{r plot2, echo=FALSE}
+lnwght=1
+
+#Wauna
+ggplot(loaddata, aes(Dy, Wauna)) +
+    geom_line(size=lnwght) +
+    geom_line(aes(Dy, Wauna.norm1),size=lnwght,col="red") +
+    geom_line(aes(Dy, Wauna.norm2),size=lnwght+1,col="blue")
+
+#Cogen
+ggplot(loaddata, aes(Dy, Cogen)) +
+    geom_line(size=lnwght) +
+    geom_line(aes(Dy, Cogen.norm1),size=lnwght,col="red")
+
+#Halsey
+ggplot(loaddata[!is.na(loaddata$Halsey),], aes(Dy, Halsey)) +
+  geom_line(size=lnwght) +
+  geom_line(aes(Dy, Halsey.norm1),col="red", size=lnwght) +
+  geom_line(aes(Dy, Halsey.norm2),col="blue", size=lnwght+1)
+
+#Camas
+ggplot(loaddata[!is.na(loaddata$Camas),], aes(Dy, Camas)) +
+  geom_line(size=lnwght)
+
+```
+
+# Plot Trend Removed
+Actuals (black), outage normalized (red), outage normalized with ee removed (blue), and outage normalized with ee removed and trend removed (green)
+
+```{r plot3, echo=FALSE,}
+lnwght=1
+
+#Wauna
+ggplot(loaddata, aes(Dy, Wauna)) +
+    geom_line(size=lnwght) +
+    geom_line(aes(Dy, Wauna.norm1),size=lnwght,col="red") +
+    geom_line(aes(Dy, Wauna.norm2),size=lnwght,col="blue") +
+    geom_line(aes(Dy, Wauna.norm3),size=lnwght+1,col="green4")
+
+#Cogen
+ggplot(loaddata, aes(Dy, Cogen)) +
+    geom_line(size=lnwght) +
+    geom_line(aes(Dy, Cogen.norm1),size=lnwght,col="red")+
+    geom_line(aes(Dy, Cogen.norm3),size=lnwght+1,col="green4")
+
+#Halsey
+ggplot(loaddata[!is.na(loaddata$Halsey),], aes(Dy, Halsey)) +
+  geom_line(size=lnwght) +
+  geom_line(aes(Dy, Halsey.norm1),col="red", size=lnwght) +
+  geom_line(aes(Dy, Halsey.norm2),col="blue", size=lnwght)+
+  geom_line(aes(Dy, Halsey.norm3),col="green4", size=lnwght+1)
+
+#Camas
+ggplot(loaddata[!is.na(loaddata$Camas),], aes(Dy, Camas)) +
+  geom_line(size=lnwght) +
+  geom_line(aes(Dy, Camas.norm3),col="green4", size=lnwght+1)
+
+```
+
+```{r somestuff, include=F}
+summary(megaframe[megaframe$Type=="Actual",]);cat("\n")
+summary(megaframe[megaframe$Type=="Simulated",]);cat("\n")
+summary(megaframe[megaframe$Type=="Forecast",])
+
+#Proportion of Cogen zeros Actual
+length(which(megaframe[megaframe$Type=="Actual",]$Cogen == 0))/nrow(megaframe[megaframe$Type=="Actual",])
+
+#Proportion of cogen zeros - Simulated
+length(which(megaframe[megaframe$Type=="Simulated",]$Cogen == 0))/nrow(megaframe[megaframe$Type=="Simulated",])
+
+#Are there actually zeroes for Camas?
+length(which(megaframe[megaframe$Type=="Simulated",]$Camas == 0))
+length(which(megaframe[megaframe$Type=="Actual",]$Camas == 0))
+length(which(megaframe[megaframe$Type=="Simulated",]$Camas == 0))
+
+```
+
+```{r outputmelt, echo=F}
+outputframe<-simframe %>%
+        melt(id.vars=c("MonYr",
+                       "Run",
+                       "Type"),
+             measure.vars = c("Wauna",
+                              "Cogen",
+                              "Halsey",
+                              "Camas")) %>%
+        transmute(Source= "PwrAnalyst", 
+                  PublishDate= as.Date(Sys.time()), 
+                  Description=Type ,
+                  Year= year(MonYr),
+                  Quarter= quarter(MonYr),
+                  Period_Start= MonYr,
+                  Period_End= ceiling_date(MonYr, "month") - days(1) ,
+                  Run=Run,
+                  Variable= variable,
+                  Unit = "aMW",
+                  Value=value )
+```
+
+```{r testx}
+mean(actyrframe[actyrframe$
+
+```
+
+
+
+```{r writeoutput, include=F}
+  write.csv(outputframe, file= (paste0("\\\\itv00006\\sqlupload$", "\\Simulation_Data.csv")),row.names=FALSE, quote=FALSE)
+```

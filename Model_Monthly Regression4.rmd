@@ -1,0 +1,1677 @@
+---
+title: "Load Forecast"
+author: "Ian Bledsoe"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  word_document: default
+knit: (
+  function(inputFile, encoding) { 
+  
+    rmarkdown::render( 
+      input       = inputFile, 
+      encoding    = encoding, 
+      output_file = paste(Sys.Date(), 'Load Forecast')) })
+---
+<!--
+Hello World! (UCB Application reviewers)
+This R Model I wrote takes inputs of historic Load (energy usage), Temperature, Energy efficiency,
+outages, load factors, and peak usage. Energy efficiency achievements are removed from historic,
+and the trend is also removed. Models are built that regress load on different predictors; for residential,
+only Heating Degree Days and Cooling Degree Days are significant. For industrial loads, predictors are certain months
+as a matrix of dummy variables, and outages. One of the mills uses RandomForest model, which had better in-sample
+predictive power than linear models. Finally, some of our large customers have seen large changes in operations such that using the historical without adjustment gives unreasonable results. I determined that a simple short-term historic average projected into the future gave reasonable results. In the case of Residential/Commercial, trend is added back to the forecast. For all loads where historic Energy Efficiency is known, I use energy efficiency as a percentage of energy, along with an exponential decay formula, trying to model the fact that as more energy efficiency is achieved, additional energy efficiency becomes harder to acquire.
+
+The rest of the code is creating various graphs showing detrending and forecasting results, and formatting and translating the results to the various units of measure that users require.
+
+Thanks for looking. Excuse the mess!
+
+-->
+
+
+
+
+
+
+
+
+
+<!-- %$% is pipe operator for when not passing last as *first* argument (avg has only one argument) -->
+
+<!-- n1 EE removed-->
+<!-- n2 Detrended-->
+<!-- f Raw forecast-->
+<!-- f1 Added trend (pos or neg)-->
+<!-- f2 added EE (removed load)-->
+<!-- ff forecast with final adjustments made (new load, finger on scale)-->
+
+```{r setup, include=FALSE, warning=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r global_options, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE)
+knitr::opts_knit$set(root.dir = '...')
+```
+
+#Setup
+```{r loadpkgs, include=F, results='hide'}
+#set.seed(1)
+source('\\\\itv00005\\Power\\Data_Systems\\R\\CustomFunctions.R', local=TRUE)
+detachAllPackages()
+
+library(lubridate)#date manipulation library
+library(svMisc)
+library(magrittr) #pipe operators
+library(reshape2) #pivot DEPRECATED?!?!
+library(crayon) #allows print (text) with color
+library(forecast) #auto.arima
+library(zoo) #yearmon
+library(lattice) #xyplot
+library(gridExtra) #need this for display of lattice graphs
+library(MASS) #for mvnorm, scale
+library(marima)
+library(ggplot2)
+library(MLmetrics) #MAPE
+library(randomForest)
+library(gbm) #gradient boosted modeling
+library(caTools) #sample.split
+library(rpart) #Regression trees
+library(rpart.plot)
+library(neuralnet)
+library(data.table)
+library(RODBC)
+library(lmtest) #dwtest (Durbin-Watson test for autocorrelation)
+library(ggpubr)
+library(tis)
+library(scales)
+library(dplyr) #load last; plyr conflict
+```
+
+```{r cleanup, include=F}
+#Cleanup workspace----
+cat("\014") #clear console
+rm(list=setdiff(ls(), c("loaddataX"))) #remove objects
+options(scipen=999) #prevents scientific notation
+```
+
+#Source setup
+```{r sqlsetup, include=F}
+#SQL Setup----
+channel <- odbcConnect("Superpower")
+loadhour<-sqlQuery(channel, "execute LAT_LoadHour_Vertical");loadhour$Monthyear<-as.Date(loadhour$Monthyear)
+outdata<-sqlQuery(channel, "execute LAT_Outages") #Slow ~30s
+loaddata<-sqlQuery(channel, "execute LAT_Load") #Slow ~20s
+tdata<-sqlQuery(channel, "Select * from [NCEI_LCD_Imputed]") #, as.is=TRUE
+factordata<-sqlQuery(channel, "execute LAT_Load_Factors") #Slow ~15s
+eedata<-sqlQuery(channel, "execute LAT_Energy_Efficiency") #Slow ~15s
+peakactuals<-sqlQuery(channel, "execute LAT_Peak_Actuals") #SLOW
+close(channel)
+```
+
+```{r parameters}
+waunastart.ee<-"2021-01-01"
+testdata.start<-'2021-01-01'
+basetemp<-62
+#newload start date, amount?
+```
+
+#Loaddata setup
+```{r loaddatasetup}
+rescomsplit<-read.csv('\\\\itv00005\\Power\\Data_Systems\\R\\Load Forecast\\rescomsplit.csv', stringsAsFactors = FALSE, strip.white = TRUE)
+rescomsplit$MonYr<-as.Date(rescomsplit$MonYr)
+loadshape<-read.csv('\\\\itv00005\\Power\\Data_Systems\\R\\Load Forecast\\MonthLoadScaling.csv', stringsAsFactors = FALSE, strip.white = TRUE)
+
+peakactuals$MonthYear<-as.Date(peakactuals$MonthYear)
+
+loaddata$Dy<-as.Date(loaddata$Dy)
+loaddata$nonWaunaSystem<-as.numeric(loaddata$nonWaunaSystem)
+loaddata$Load_hour<-as.factor(loaddata$Load_hour)
+loaddata$timeseq<-rep(1:(nrow(loaddata)/2), each=2)
+loaddata$revtimeseq<-rev(rep(1:(nrow(loaddata)/2), each=2))
+loaddata$nonWaunaSystem.n1<-NA; loaddata$nonWaunaSystem.n2<-NA
+loaddata$Wauna.n1<-NA; loaddata$Wauna.n2<-NA
+loaddata$Biorefinery.n1<-NA; loaddata$Biorefinery.n2<-NA
+loaddata$Halsey.n1<-NA; loaddata$Halsey.n2<-NA
+loaddata$Camas.n1<-NA; loaddata$Camas.n2<-NA
+loaddata$month<-month(loaddata$Dy)
+loaddata<-merge(loaddata, loadshape, by.x=c("month", "Load_hour"), by.y=c("Month", "LoadHr"))
+loaddata<-loaddata[order(loaddata$Dy),]
+
+monmatrix<-data.frame(model.matrix(~ factor(loaddata$month) + 0))
+names(monmatrix)<- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+loaddata<-cbind(loaddata, monmatrix)
+testdata<-loaddata[year(loaddata$Dy)==year(testdata.start) & loaddata$Dy < floor_date(Sys.Date(), unit="months"),c(1:10, 21:32)]
+
+testdata$SystemSales<-testdata$nonWaunaSystem+testdata$Biorefinery+testdata$Wauna
+testdata$ExtendedSales<-testdata$Halsey+testdata$Camas
+testdata$TotalSales<-testdata$SystemSales+testdata$ExtendedSales
+testdata$TotalSales_exHalsey<-testdata$SystemSales+testdata$Camas
+
+loaddata<-loaddata[loaddata$Dy<testdata.start,]
+outdata$Dy<-as.Date(outdata$Dy)
+
+```
+
+#Temp setup
+```{r tempsetup}
+###sql query to final imputed
+
+tempdata<-tdata %>%
+                    group_by(Tstamp
+                             ,Load_Hour) %>%
+                    mutate(KELSO_HDD=max(basetemp-Kelso_F, 0),
+                           KELSO_CDD=abs(min(basetemp-Kelso_F, 0))) %>%
+                    group_by(Tstamp,
+                             Load_Hour) %>%
+                    summarise(HDD=mean(KELSO_HDD) * (n()/24),
+                              CDD=mean(KELSO_CDD) * (n()/24)) %>%
+                    group_by(MonYr=floor_date(Tstamp, "month"),
+                             Load_Hour) %>%
+                    summarise(HDD=sum(HDD),
+                              CDD=sum(CDD))
+
+n_tempdata<- tempdata[tempdata$MonYr<as.POSIXct(cut(Sys.Date(), "month")),] %>%
+                  group_by(Month=month(MonYr),
+                           Load_Hour) %>%
+                  summarise(N_HDD=round(mean(HDD),0),
+                            N_CDD=round(mean(CDD), 0))
+
+testdata<-merge(testdata, tempdata, by.x=c("Dy", "Load_hour"), by.y=c("MonYr", "Load_Hour"))
+testdata<-merge(testdata, n_tempdata, by.x=c("month", "Load_hour"), by.y=c("Month", "Load_Hour"), all.x=TRUE)
+
+loaddata<-merge(loaddata, tempdata, by.x=c("Dy", "Load_hour"), by.y=c("MonYr", "Load_Hour"))
+loaddata<-setorder(merge(loaddata, n_tempdata, by.x=c("month", "Load_hour"), by.y=c("Month", "Load_Hour"), all.x=TRUE), Dy)
+```
+
+
+#Rescomsplit model
+```{r rcsplitmodel}
+rescomsplit<- merge(rescomsplit, tempdata, by.x=c("MonYr", "Load_hour"), by.y=c("MonYr", "Load_Hour"), all.x=TRUE)
+m.rescomsplit<-lm(Res_Split~HDD+CDD,data=rescomsplit)
+```
+
+#EEdata setup
+```{r eedatasetup}
+eedata$Month_Claimed<-as.Date(eedata$Month_Claimed)
+# mframe<-data.frame("MonYr"=as.Date(seq(ymd(min(eedata$Month_Claimed)),ymd(max(eedata$Month_Claimed)), by = 'months')))
+mframe<-data.frame("MonYr"=as.Date(seq(min(eedata$Month_Claimed),max(eedata$Month_Claimed), by = 'months')))
+#this merge breaks it
+eedata<-merge(mframe, eedata, by.x="MonYr", by.y="Month_Claimed", all=T)
+eedata[is.na(eedata)]<-0
+eehistoric<-eedata[eedata$MonYr>="2004-01-01",] %>%
+                    group_by(MonYr) %>%
+                    summarise(Res=max(res.ee),
+                            Wauna=max(wauna.ee),
+                            Halsey=max(halsey.ee),
+                            Bio=max(bio.ee)) %>%
+                    mutate(cumRes=cumsum(Res),
+                           cumWauna=cumsum(Wauna),
+                           cumHalsey=cumsum(Halsey),
+                           cumBio=cumsum(Bio)) %>%
+                    group_by(Year=year(MonYr)) %>%
+                    summarise(Res_ee=max(cumRes),
+                            Wauna_ee=max(cumWauna),
+                            Halsey_ee=max(cumHalsey),
+                            Biorefinery_ee=max(cumBio))
+eehistoric$ee_exHalsey<-eehistoric$Res_ee+eehistoric$Wauna_ee+eehistoric$Biorefinery_ee
+eedata<-merge(eedata, loaddata[,1:8], by.x="MonYr", by.y="Dy", all.x=T)
+eedata$res.ee.pct<-eedata$res.ee/eedata$nonWaunaSystem
+eedata$wauna.ee.pct<-eedata$wauna.ee/eedata$Wauna
+eedata$halsey.ee.pct<-eedata$halsey.ee/eedata$Halsey
+eedata$bio.ee.pct<-eedata$bio.ee/eedata$Biorefinery
+
+eedata<-eedata[eedata$MonYr>='2004-01-01' & eedata$MonYr<testdata.start ,] # why nothing after this date?
+#eedata<-eedata[eedata$MonYr>='2004-01-01',] # why nothing after this date?
+eedata<-as.data.frame(eedata)
+eedata[is.na(eedata)]<-0
+eedata$cumResidential<-NA
+eedata$cumWauna<-NA
+eedata$cumBiorefinery<-NA
+eedata$cumHalsey<-NA
+eedata[eedata$Load_hour=="LLH",]$cumResidential<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="LLH",]$res.ee))))
+eedata[eedata$Load_hour=="LLH",]$cumWauna<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="LLH",]$wauna.ee))))
+eedata[eedata$Load_hour=="LLH",]$cumBiorefinery<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="LLH",]$bio.ee))))
+eedata[eedata$Load_hour=="LLH",]$cumHalsey<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="LLH",]$halsey.ee))))
+eedata[eedata$Load_hour=="HLH",]$cumResidential<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="HLH",]$res.ee))))
+eedata[eedata$Load_hour=="HLH",]$cumWauna<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="HLH",]$wauna.ee))))
+eedata[eedata$Load_hour=="HLH",]$cumBiorefinery<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="HLH",]$bio.ee))))
+eedata[eedata$Load_hour=="HLH",]$cumHalsey<-as.numeric(rev(cumsum(rev(eedata[eedata$Load_hour=="HLH",]$halsey.ee))))
+loaddata<-merge(loaddata, eedata[, c("MonYr", "Load_hour", "cumResidential", "cumWauna", "cumBiorefinery", "cumHalsey")], by.x=c("Dy", "Load_hour"), by.y=c("MonYr","Load_hour"), all=F)
+```
+
+#outagedata setup
+```{r outagedatasetup}
+outdata$Dy<-as.Date(outdata$Dy)
+outdata<-outdata[outdata$Dy>='2004-01-01' & outdata$Dy<testdata.start,]
+loaddata<-merge(loaddata, outdata, by.x=c("Dy", "Load_hour"), by.y=c("Dy", "Load_hour"), all=T)
+
+loaddata[is.na(loaddata$WaunaOut),]
+```
+
+<!-- Outage Normalization removed -->
+
+#Remove EE
+```{r scale_ee}
+loaddata$cumResidential<-loaddata$cumResidential * loaddata$ResRatio 
+loaddata$cumWauna<-loaddata$cumWauna * loaddata$WaunaRatio 
+loaddata$cumHalsey<-loaddata$cumHalsey * loaddata$HalseyRatio
+loaddata$cumBiorefinery<-loaddata$cumBiorefinery * loaddata$BioRatio
+```
+
+```{r remove_ee}
+loaddata$nonWaunaSystem.n1<-loaddata$nonWaunaSystem - loaddata$cumResidential
+loaddata$Wauna.n1<-loaddata$Wauna - loaddata$cumWauna
+loaddata$Halsey.n1<-loaddata$Halsey - loaddata$cumHalsey
+loaddata$Biorefinery.n1<-loaddata$Biorefinery - loaddata$cumBiorefinery
+loaddata$Camas.n1<-loaddata$Camas #We don't know anything about Camas' EE
+```
+
+<!-- Weather Normalization Removed -->
+
+<!-- Get trend b4 ee removed? -->
+#Detrend Historic
+```{r detrend}
+#Detrend res & save the trend
+hlh.resmod<-lm(nonWaunaSystem.n1~timeseq, data=loaddata[loaddata$Load_hour=='HLH',])
+llh.resmod<-lm(nonWaunaSystem.n1~timeseq, data=loaddata[loaddata$Load_hour=='LLH',])
+
+llh.restrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='LLH',]$nonWaunaSystem.n1, start=c(2004, 1), freq=12), lag=12, simple=T)/100+1)))-1
+hlh.restrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='HLH',]$nonWaunaSystem.n1, start=c(2004, 1), freq=12), lag=12, simple=F)/100+T)))-1
+cat("llh.restrend: ", llh.restrend)
+cat("hlh.restrend: ", hlh.restrend)
+
+loaddata[loaddata$Load_hour=='LLH',]$nonWaunaSystem.n2<-loaddata[loaddata$Load_hour=='LLH',]$nonWaunaSystem.n1 + (llh.resmod$coefficients[2] * loaddata[loaddata$Load_hour=='LLH',]$revtimeseq)
+loaddata[loaddata$Load_hour=='HLH',]$nonWaunaSystem.n2<-loaddata[loaddata$Load_hour=='HLH',]$nonWaunaSystem.n1 + (hlh.resmod$coefficients[2] * loaddata[loaddata$Load_hour=='HLH',]$revtimeseq)
+
+#Detrend Halsey & save the trend
+hlh.halseymod<-lm(Halsey.n1~timeseq, data=loaddata[loaddata$Load_hour=='HLH',])
+llh.halseymod<-lm(Halsey.n1~timeseq, data=loaddata[loaddata$Load_hour=='LLH',])
+
+llh.halseytrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='LLH',]$Halsey.n1, start=c(2004, 1), freq=12), lag=12, simple=T)/100+1)))-1
+hlh.halseytrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='HLH',]$Halsey.n1, start=c(2004, 1), freq=12), lag=12, simple=T)/100+1)))-1
+cat("llh.halseytrend: ", llh.halseytrend)
+cat("hlh.halseytrend: ", hlh.halseytrend)
+
+
+loaddata[loaddata$Load_hour=='LLH',]$Halsey.n2<-loaddata[loaddata$Load_hour=='LLH',]$Halsey.n1 + (llh.halseymod$coefficients[2] * loaddata[loaddata$Load_hour=='LLH',]$revtimeseq)
+loaddata[loaddata$Load_hour=='HLH',]$Halsey.n2<-loaddata[loaddata$Load_hour=='HLH',]$Halsey.n1 + (hlh.halseymod$coefficients[2] * loaddata[loaddata$Load_hour=='HLH',]$revtimeseq)
+
+#Detrend Wauna & save the trend
+hlh.waunamod<-lm(Wauna.n1~timeseq, data=loaddata[loaddata$Load_hour=='HLH',])
+llh.waunamod<-lm(Wauna.n1~timeseq, data=loaddata[loaddata$Load_hour=='LLH',])
+
+llh.waunatrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='LLH',]$Wauna.n1, start=c(2004, 1), freq=12), lag=12, simple=T)/100+1)))-1
+hlh.waunatrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='HLH',]$Wauna.n1, start=c(2004, 1), freq=12), lag=12, simple=T)/100+1)))-1
+
+cat("llh.waunatrend: ", llh.waunatrend)
+cat("hlh.waunatrend: ", hlh.waunatrend)
+
+loaddata[loaddata$Load_hour=='LLH',]$Wauna.n2<-loaddata[loaddata$Load_hour=='LLH',]$Wauna.n1 + (llh.waunamod$coefficients[2] * loaddata[loaddata$Load_hour=='LLH',]$revtimeseq)
+loaddata[loaddata$Load_hour=='HLH',]$Wauna.n2<-loaddata[loaddata$Load_hour=='HLH',]$Wauna.n1 + (hlh.waunamod$coefficients[2] * loaddata[loaddata$Load_hour=='HLH',]$revtimeseq)
+
+#Detrend BIO & save the trend
+loaddata[loaddata$Dy < "2013-01-01", "Biorefinery.n1"] <- NA #We don't want old ops influencing the trend (na.omit below)
+hlh.biomod<-lm(Biorefinery.n1~timeseq, data=loaddata[loaddata$Load_hour=='HLH',], na.action=na.omit)
+llh.biomod<-lm(Biorefinery.n1~timeseq, data=loaddata[loaddata$Load_hour=='LLH',], na.action=na.omit)
+
+llh.biotrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='LLH' & !is.na(loaddata$Biorefinery.n1),]$Biorefinery.n1, start=c(2008, 1), freq=12), lag=12, simple=T)/100+1)))-1
+hlh.biotrend<-exp(mean(log(growth.rate(as.tis(loaddata[loaddata$Load_hour=='HLH' & !is.na(loaddata$Biorefinery.n1),]$Biorefinery.n1, start=c(2008, 1), freq=12), lag=12, simple=T)/100+1)))-1
+
+loaddata[loaddata$Load_hour=='LLH' & !is.na(loaddata$Biorefinery.n1),]$Biorefinery.n2<-na.omit(loaddata[loaddata$Load_hour=='LLH',]$Biorefinery.n1) + (llh.biomod$coefficients[2] * rev(seq(length(na.omit(loaddata[loaddata$Load_hour=="LLH","Biorefinery.n1"])))))
+loaddata[loaddata$Load_hour=='HLH' & !is.na(loaddata$Biorefinery.n1),]$Biorefinery.n2<-na.omit(loaddata[loaddata$Load_hour=='HLH',]$Biorefinery.n1) + (hlh.biomod$coefficients[2] * rev(seq(length(na.omit(loaddata[loaddata$Load_hour=="HLH","Biorefinery.n1"])))))
+
+#CAMAS not detrended - too little history
+loaddata[loaddata$Dy < "2018-6-01", "Camas.n1"] <- NA #We don't want old ops influencing the trend (na.omit below)
+loaddata$Camas.n2 <- loaddata$Camas.n1
+
+```
+
+#Setup forecast
+```{r forecast_frame}
+sdate<-max(loaddata$Dy);month(sdate)<-month(sdate)+1
+endyr<-2040
+edate<-as.Date(paste0(endyr, "-12-01"))
+forecastframe<-data.frame("MonYr"=rep(as.Date(seq(sdate , edate, by = 'months')), each=2),
+                  "Load_hour"= rep(loaddata[1:24,]$Load_hour, times=year(edate)-year(sdate) + 1),
+                  "nonWaunaSystem.f" = NA,
+                  "nonWaunaSystem.f1" = NA,
+                  "nonWaunaSystem.f2" = NA,
+                  "Wauna.f" = NA,
+                  "Wauna.f1" = NA,
+                  "Wauna.f2" = NA,
+                  "Wauna.ff" = NA,
+                  "Biorefinery.f" = NA,
+                  "Biorefinery.f1" = NA,
+                  "Biorefinery.f2" = NA,
+                  "Biorefinery.ff" = NA,
+                  "Halsey.f" = NA,
+                  "Halsey.f1" = NA,
+                  "Halsey.f2" = NA,
+                  "Halsey.ff" = NA,
+                  "Camas.f" = NA,
+                  "Camas.f1" = NA,
+                  "Camas.f2" = NA,
+                  "Camas.ff" = NA,
+                  "HDD" = rep(loaddata[1:24,]$N_HDD,times=year(edate)-year(sdate) + 1),
+                  "CDD" = rep(loaddata[1:24,]$N_CDD,times=year(edate)-year(sdate) + 1),
+                  "timeseq" = rep(1:((year(edate)-year(sdate) + 1)*12), each=2),
+                  "revtimeseq" = rev(rep(1:((year(edate)-year(sdate) + 1)*12), each=2)),
+                  "nonWaunaSystem.ee" = NA,
+                  "Wauna.ee" = 0,
+                  "Biorefinery.ee" = 0,
+                  "Halsey.ee" = 0,
+                  "Camas.ee" = 0,
+                  "nonWaunaSystem.out" = 0,
+                  "WaunaOut" = 0,
+                  "BiorefineryOut" = 0,
+                  "HalseyOut" = 0,
+                  "CamasOut" = 0)
+forecastframe$out<- year(forecastframe$MonYr) %% 3 == 0
+monmatrix<-data.frame(model.matrix(~ factor(month(forecastframe$MonYr)) + 0))
+names(monmatrix)<- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+forecastframe<-cbind(forecastframe, monmatrix)
+forecastframe$month<-month(forecastframe$MonYr)
+
+source('\\\\itv00005\\Power\\Data_Systems\\R\\CustomFunctions.R', local=TRUE) #maybe this will fix problem of not loading?
+
+#Normal factors came up with much better peak forecast for 2019, which was an outage year. Using outageyr factors no bueno
+#This was true in the first half of the test year, but not great in second half
+#Maybe just Apr/May for 
+factordata$month<-month(factordata$MonYr)
+factordata$out <- year(factordata$MonYr) %% 3 == 0
+
+#Factors where Wauna outage doesnt matter
+factor1<-factordata %>%
+        group_by(month=month(MonYr)) %>%
+        summarise(nonWaunaSystem_LF=geoMean(nonWaunaSystem_LF),
+                  Biorefinery_LF=geoMean(Biorefinery_LF),
+                  Halsey_LF=geoMean(Halsey_LF),
+                  Camas_LF=geoMean(Camas_LF))
+
+#Factors where Wauna outage matters, but Camas doesnt.
+factor2<-factordata %>%
+        group_by(month=month(MonYr), out) %>%
+        summarise(Wauna_LF=geoMean(Wauna_LF),
+                  Sys_LF=geoMean(Sys_LF),
+                  Total_exCamas_LF=mean(Total_exCamas_LF))
+
+#Factors where Camas and wauna outage matter
+factor3<-factordata[!(is.na(factordata$Camas_LF)) & month(factordata$MonYr)==5,] %>%
+        group_by(month=month(MonYr), out) %>%
+        summarise(Total_LF=mean(Total_LF),
+                  Total_exHalsey_LF=mean(Total_exHalsey_LF))
+
+#But hist camas doesnt go back to the first half of any non-outage year!
+factor4<-factordata[!(is.na(factordata$Camas_LF)),] %>%
+        group_by(month=month(MonYr)) %>%
+        summarise(Total_LF=mean(Total_LF),
+                  Total_exHalsey_LF=mean(Total_exHalsey_LF))
+
+
+forecastframe<-merge(forecastframe, factor1, by.x="month", by.y="month", all.x=T)
+forecastframe<-merge(forecastframe, factor2, by.x=c("month", "out"), by.y=c("month", "out"), all.x=T)
+forecastframe<-merge(forecastframe, factor3, by.x=c("month", "out"), by.y=c("month", "out"), all.x=T)
+
+#Should no longer merge anything once there's at least a month of load factor data in prev line
+temp.frame<-merge(forecastframe[(is.na(forecastframe$Total_LF)),], factor4, by.x="month", by.y="month", all.x=T)
+forecastframe[(is.na(forecastframe$Total_LF)),]$Total_LF<-temp.frame[(is.na(temp.frame$Total_LF.x)),]$Total_LF.y
+forecastframe[(is.na(forecastframe$Total_exHalsey_LF)),]$Total_exHalsey_LF<-temp.frame[(is.na(temp.frame$Total_exHalsey_LF.x)),]$Total_exHalsey_LF.y
+
+
+
+# View(forecastframe[,c("MonYr", "Total_LF")])
+# View(forecastframe[,c("MonYr", "Total_LF", "Total_aMW", "Total_MW")])
+
+
+# forecastframe[(month(forecastframe$MonYr) == 5 & year(forecastframe$MonYr) %% 3 == 0),]$Sys_LF<-factor.out$Sys_LF
+# forecastframe[(month(forecastframe$MonYr) == 5 & year(forecastframe$MonYr) %% 3 == 0),]$Ext_LF<-factor.out$Ext_LF
+# forecastframe[(month(forecastframe$MonYr) == 5 & year(forecastframe$MonYr) %% 3 == 0),]$Wauna_LF<-factor.out$Wauna_LF
+# forecastframe[(month(forecastframe$MonYr) == 5 & year(forecastframe$MonYr) %% 3 == 0),]$Total_LF<-factor.out$Total_LF
+
+forecastframe<-merge(forecastframe, loadhour, by.x=c("MonYr", "Load_hour"), by.y=c("Monthyear", "Load_Hour"), all.x=T)
+
+forecastframe$ressplit<-predict(m.rescomsplit,newdata=forecastframe)
+forecastframe$comsplit<-1-forecastframe$ressplit
+
+setorder(forecastframe, MonYr)
+```
+
+```{r outage_setup}
+#Normal outages after 2009 b/c they used to have outages in June.
+#No normal outages except in Apr, May, Jun
+#Year / 3; no remainder means cold outage year.
+
+forecastframe[forecastframe$Load_hour=='LLH' & year(forecastframe$MonYr) %% 3 == 0 & month(forecastframe$MonYr) %in% c(4, 5, 6),]$WaunaOut <-loaddata[loaddata$Load_hour=='LLH' & (year(loaddata$Dy) %% 3 == 0) & (year(loaddata$Dy) > 2009) & (loaddata$month %in% c(4, 5, 6)),] %>%
+                                                                group_by(month) %>%
+                                                                summarise(avg=mean(WaunaOut)) %$%
+                                                                avg
+
+forecastframe[forecastframe$Load_hour=='HLH' & year(forecastframe$MonYr) %% 3 == 0 & month(forecastframe$MonYr) %in% c(4, 5, 6),]$WaunaOut <-loaddata[loaddata$Load_hour=='HLH' & (year(loaddata$Dy) %% 3 == 0) & (year(loaddata$Dy) > 2009) & (loaddata$month %in% c(4, 5, 6)),] %>%
+                                                                group_by(month) %>%
+                                                                summarise(avg=mean(WaunaOut)) %$%
+                                                                avg
+
+forecastframe[forecastframe$Load_hour=='LLH' & year(forecastframe$MonYr) %% 3 != 0 & month(forecastframe$MonYr) %in% c(4, 5, 6),]$WaunaOut <-loaddata[loaddata$Load_hour=='LLH' & (year(loaddata$Dy) %% 3 != 0) & (year(loaddata$Dy) > 2009) & (loaddata$month %in% c(4, 5, 6)),] %>%
+                                                                group_by(month) %>%
+                                                                summarise(avg=mean(WaunaOut)) %$%
+                                                                avg
+
+forecastframe[forecastframe$Load_hour=='HLH' & year(forecastframe$MonYr) %% 3 != 0 & month(forecastframe$MonYr) %in% c(4, 5, 6),]$WaunaOut <-loaddata[loaddata$Load_hour=='HLH' & (year(loaddata$Dy) %% 3 != 0) & (year(loaddata$Dy) > 2009) & (loaddata$month %in% c(4, 5, 6)),] %>%
+                                                                group_by(month) %>%
+                                                                summarise(avg=mean(WaunaOut)) %$%
+                                                                avg
+
+#Halsey Outage setup-Deprecated - I don't know enough about their outages
+# forecastframe[forecastframe$Load_hour=='LLH',]$HalseyOut <- rep(loaddata[loaddata$Load_hour=='LLH',] %>%
+#                                                                 group_by(month) %>%
+#                                                                 summarise(avg=mean(HalseyOut)) %$%
+#                                                                 avg)
+# forecastframe[forecastframe$Load_hour=='HLH',]$HalseyOut <- rep(loaddata[loaddata$Load_hour=='HLH',] %>%
+#                                                                 group_by(month) %>%
+#                                                                 summarise(avg=mean(HalseyOut)) %$%
+#                                                                 avg)
+#Test Outage setup
+testdata<-merge(testdata, forecastframe[,c("MonYr","Load_hour", "WaunaOut", "HalseyOut")], by.x=c("Dy","Load_hour"), by.y=c("MonYr", "Load_hour"), all.x=TRUE)
+
+```
+#Forecast
+```{r res_f}
+#HLH
+hlh.resmod<-lm(nonWaunaSystem.n2~HDD+CDD,  data=loaddata[loaddata$Load_hour=='HLH',])
+hlh.res.f<-predict(hlh.resmod, newdata=forecastframe[loaddata$Load_hour=="HLH",])
+#LLH
+llh.resmod<-lm(nonWaunaSystem.n2~HDD+CDD, data=loaddata[loaddata$Load_hour=='LLH',])
+llh.res.f<-predict(llh.resmod, newdata=forecastframe[loaddata$Load_hour=="LLH",])
+
+forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f<-hlh.res.f
+forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f<-llh.res.f
+
+```
+
+```{r wauna_f}
+#HLH
+# hlh.waunamod<-randomForest(Wauna.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+WaunaOut,data=loaddata[loaddata$Load_hour=='HLH'& loaddata$Dy>="2009-01-01",],mtry=4, ntrees=201 )
+#summary(lm(Wauna.n2~HDD+WaunaOut,data=loaddata[loaddata$Load_hour=='HLH'& loaddata$Dy>="2009-01-01",]))
+
+hlh.waunamod<-lm(Wauna.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+WaunaOut,data=loaddata[loaddata$Load_hour=='HLH'& loaddata$Dy>="2009-01-01",])
+
+hlh.wauna.f<-predict(hlh.waunamod, newdata=forecastframe[forecastframe$Load_hour=="HLH",])
+
+#LLH
+# llh.waunamod<-randomForest(Wauna.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+WaunaOut, data=loaddata[loaddata$Load_hour=='LLH'& loaddata$Dy>="2009-01-01",], mtry=4, ntrees=201)
+#summary(lm(Wauna.n2~HDD+WaunaOut,data=loaddata[loaddata$Load_hour=='LLH'& loaddata$Dy>="2009-01-01",]))
+
+llh.waunamod<-lm(Wauna.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+WaunaOut+HDD, data=loaddata[loaddata$Load_hour=='LLH'& loaddata$Dy>="2009-01-01",])
+llh.wauna.f<-predict(llh.waunamod, newdata=forecastframe[forecastframe$Load_hour=="LLH",])
+
+#Jan+Feb+Mar+Apr+May+Jun+Jul+Aug+Sep+Oct+Nov+Dec
+
+# hlh.waunamod<-lm(Wauna.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+WaunaOut,data=loaddata[loaddata$Load_hour=='HLH' & loaddata$Dy>="2009-01-01",])
+# 
+# hlh.wauna.f<-predict(hlh.waunamod, newdata=forecastframe[forecastframe$Load_hour=="HLH",])
+# #LLH
+# llh.waunamod<-lm(Wauna.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+WaunaOut,data=loaddata[loaddata$Load_hour=='LLH' & loaddata$Dy>="2009-01-01",])
+# 
+# llh.wauna.f<-predict(llh.waunamod, newdata=forecastframe[forecastframe$Load_hour=="LLH",])
+
+forecastframe[forecastframe$Load_hour=="LLH",]$Wauna.f<-llh.wauna.f
+forecastframe[forecastframe$Load_hour=="HLH",]$Wauna.f<-hlh.wauna.f
+```
+
+```{r halsey_f}
+#HLH
+hlh.halseymod<-randomForest(Halsey.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+HalseyOut, mtry=2, data=loaddata[loaddata$Load_hour=='HLH',])
+hlh.halsey.f<-predict(hlh.halseymod, newdata=forecastframe[forecastframe$Load_hour=="HLH",])
+
+#LLH
+llh.halseymod<-randomForest(Halsey.n2~Jan+Feb+Mar+Apr+Jun+Jul+Aug+Sep+Oct+Nov+Dec+HalseyOut, mtry=2, data=loaddata[loaddata$Load_hour=='LLH',])
+llh.halsey.f<-predict(llh.halseymod, newdata=forecastframe[forecastframe$Load_hour=="LLH",])
+
+forecastframe[forecastframe$Load_hour=="HLH",]$Halsey.f<-hlh.halsey.f
+forecastframe[forecastframe$Load_hour=="LLH",]$Halsey.f<-llh.halsey.f
+
+```
+
+```{r bio_f}
+#No significant predictors for biorefinery. Avg.bymonth=forecast?
+# hlh.biomod<-lm(Biorefinery.norm~Apr+May+Jun+Jul+Sep, data=loaddata[loaddata$Load_hour=='HLH',])
+# summary(hlh.biomod)
+# hlh.bio.f<-predict(hlh.biomod, newdata=forecastframe[forecastframe$Load_hour=="HLH",])
+# forecastframe[forecastframe$Load_hour=="HLH",]$Biorefinery.f<-hlh.bio.f
+# 
+# llh.biomod<-lm(Biorefinery.norm~Jan+Feb+Mar+Apr+May+Jun+Jul+Aug+Sep+Oct+Nov+Dec, data=loaddata[loaddata$Load_hour=='LLH',])
+# summary(llh.biomod)
+# llh.bio.f<-predict(llh.biomod, newdata=forecastframe[forecastframe$Load_hour=="LLH",])
+# forecastframe[forecastframe$Load_hour=="LLH",]$Biorefinery.f<-llh.bio.f
+
+forecastframe[forecastframe$Load_hour=="LLH",]$Biorefinery.f<-rep(loaddata[loaddata$Load_hour=='LLH' & (year(loaddata$Dy) > 2015), ] %>%
+                                                                group_by(month) %>%
+                                                                summarise(avg=mean(Biorefinery.n2)) %$%
+                                                                avg)
+forecastframe[forecastframe$Load_hour=="HLH",]$Biorefinery.f<-rep(loaddata[loaddata$Load_hour=='HLH' & (year(loaddata$Dy) > 2015), ] %>%
+                                                                group_by(month) %>%
+                                                                summarise(avg=mean(Biorefinery.n2)) %$%
+                                                                avg)
+
+```
+
+```{r camas_f}
+##Camas Forecast - just avg >'2018-09-01'--
+forecastframe[forecastframe$Load_hour=="LLH",]$Camas.f<-rep(loaddata[loaddata$Load_hour=='LLH' & loaddata$Dy >= "2020-09-01", ] %>%
+                                                                summarise(avg=mean(Camas.n2)) %$%
+                                                                avg)
+forecastframe[forecastframe$Load_hour=="HLH",]$Camas.f<-rep(loaddata[loaddata$Load_hour=='HLH' & loaddata$Dy >= "2020-09-01", ] %>%
+                                                                summarise(avg=mean(Camas.n2)) %$%
+                                                                avg)
+
+```
+
+#Model Summaries
+```{r model_outputs, include=T}
+summary(hlh.resmod)
+summary(llh.resmod)
+
+summary(hlh.waunamod)
+summary(llh.waunamod)
+
+varImpPlot(hlh.halseymod, sort=TRUE)
+varImpPlot(llh.halseymod, sort=TRUE)
+
+```
+
+
+#Add Trend
+```{r add_trend}
+#--add Res trend
+#This is annual % applied to monthly
+
+forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f1<-forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f * ((1+hlh.restrend)^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr) - year(testdata.start)))
+forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f1<-forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f * ((1+llh.restrend)^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr) - year(testdata.start)))
+
+#--Stopped adding Wauna trend
+# forecastframe[forecastframe$Load_hour=='HLH',]$Wauna.f1<-forecastframe[forecastframe$Load_hour=='HLH',]$Wauna.f * ((1+hlh.waunatrend)^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr) - 2018))
+# forecastframe[forecastframe$Load_hour=='LLH',]$Wauna.f1<-forecastframe[forecastframe$Load_hour=='LLH',]$Wauna.f * ((1+llh.waunatrend)^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr) - 2018))
+forecastframe$Wauna.f1<-forecastframe$Wauna.f
+
+#--Stopped adding Halsey trend
+# forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.f1<-forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.f * ((1+hlh.halseytrend)^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr) - 2018))
+# forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.f1<-forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.f * ((1+llh.halseytrend)^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr) - 2018))
+forecastframe$Halsey.f1<-forecastframe$Halsey.f
+
+
+#Camas no trend
+forecastframe$Camas.f1 <- forecastframe$Camas.f
+
+#Biorefinery no trend
+forecastframe$Biorefinery.f1 <- forecastframe$Biorefinery.f
+
+
+```
+
+<!-- EE is messed up. why is RES ee positive in LLH? -->
+#Subtract EE
+```{r subtract_ee}
+# EE should be decreasing as load decreases (exp. decay) doesnt look like it
+#However, load is increasing due to added trend... Hmmm
+#--Subract Res EE
+forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f2<-forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f1 * ((1-(mean(eedata$res.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr)+1 - year(testdata.start)))
+forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f2<-forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f1 * ((1-(mean(eedata$res.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr)+1 - year(testdata.start)))
+
+#Save calculated Res EE
+forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.ee<-(forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f1 * ((1-(mean(eedata$res.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr)+1 - year(testdata.start))))-forecastframe[forecastframe$Load_hour=='HLH',]$nonWaunaSystem.f1
+forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.ee<-(forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f1 * ((1-(mean(eedata$res.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr)+1 - year(testdata.start))))-forecastframe[forecastframe$Load_hour=='LLH',]$nonWaunaSystem.f1
+
+#--Subtract Wauna EE
+forecastframe$Wauna.f2<-forecastframe$Wauna.f1
+forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f2<-forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f1 * ((1-(mean(eedata$wauna.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$MonYr)+1 - year(waunastart.ee)))
+
+forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f2<-forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f1 * ((1-(mean(eedata$wauna.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$MonYr)+1 - year(waunastart.ee)))
+
+#Save Calculated Wauna EE
+forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.ee<-(forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f1 * ((1-(mean(eedata$wauna.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$MonYr)+1 - year(waunastart.ee))))-forecastframe[forecastframe$Load_hour=='HLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f1
+
+forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.ee<-(forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f1 * ((1-(mean(eedata$wauna.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$MonYr)+1 - year(waunastart.ee))))-forecastframe[forecastframe$Load_hour=='LLH' & forecastframe$MonYr>=waunastart.ee,]$Wauna.f1
+
+#--Halsey EE
+forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.f2<-forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.f1 * ((1-(mean(eedata$halsey.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr)+1 - year(testdata.start)))
+forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.f2<-forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.f1 * ((1-(mean(eedata$halsey.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr)+1 - year(testdata.start)))
+
+forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.ee<-(forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.f1 * ((1-(mean(eedata$halsey.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='HLH',]$MonYr)+1 - year(testdata.start))))-forecastframe[forecastframe$Load_hour=='HLH',]$Halsey.f1
+forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.ee<-(forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.f1 * ((1-(mean(eedata$halsey.ee.pct)*12))^(year(forecastframe[forecastframe$Load_hour=='LLH',]$MonYr)+1 - year(testdata.start))))-forecastframe[forecastframe$Load_hour=='LLH',]$Halsey.f1
+
+#Biorefinery no EE
+forecastframe$Biorefinery.f2<-forecastframe$Biorefinery.f1
+
+#Camas no EE
+forecastframe$Camas.f2<-forecastframe$Camas.f1
+
+```
+
+#Finger on Scale
+```{r add_future_load}
+#Add future loads
+forecastframe$Newload.ff<-0
+forecastframe$Newload_LF<-1
+
+forecastframe[forecastframe$MonYr>="2024-05-01",]$Newload.ff <- 20
+forecastframe[forecastframe$MonYr>="2024-12-01",]$Newload.ff <- 30
+
+
+#Thumb on scale
+#add an aMW to Wauna load in 2020
+forecastframe$Wauna.ff<-forecastframe$Wauna.f2
+forecastframe[year(forecastframe$MonYr)==2020,]$Wauna.ff<-forecastframe[year(forecastframe$MonYr)==2020,]$Wauna.f2 + 1
+forecastframe[year(forecastframe$MonYr)==2021,]$Wauna.ff<-forecastframe[year(forecastframe$MonYr)==2021,]$Wauna.f2 + 1
+
+#Wauna deferred spring 2020 outage, Force outage into October 2020, Delete after 2020
+try(forecastframe[forecastframe$MonYr=="2020-10-01",]$Wauna.ff<-67)
+#Wauna moved up Spring 21 outage due to cogen going offline
+try(forecastframe[forecastframe$MonYr=="2021-04-01" & forecastframe$Load_hour=='HLH',]$Wauna.ff<-67.3)
+try(forecastframe[forecastframe$MonYr=="2021-04-01" & forecastframe$Load_hour=='LLH',]$Wauna.ff<-68.8)
+try(forecastframe[forecastframe$MonYr=="2021-05-01"& forecastframe$Load_hour=='HLH',]$Wauna.ff<-73.8)
+try(forecastframe[forecastframe$MonYr=="2021-05-01" & forecastframe$Load_hour=='LLH',]$Wauna.ff<-74.4)
+
+#Res no adjustments
+forecastframe$nonWaunaSystem.ff<-forecastframe$nonWaunaSystem.f2
+#Camas no adjustments
+forecastframe$Camas.ff<-forecastframe$Camas.f2
+#Biorefinery no adjustments
+forecastframe$Biorefinery.ff<-forecastframe$Biorefinery.f2
+#Halsey
+forecastframe$Halsey.ff<-forecastframe$Halsey.f2
+
+#Aggregations
+forecastframe$SystemSales.ff<-forecastframe$nonWaunaSystem.ff+forecastframe$Biorefinery.ff+forecastframe$Wauna.ff
+forecastframe$SystemSales_NL.ff<-forecastframe$nonWaunaSystem.ff+forecastframe$Biorefinery.ff+forecastframe$Wauna.ff+forecastframe$Newload.ff
+forecastframe$ExtendedSales.ff<-forecastframe$Halsey.ff+forecastframe$Camas.ff
+
+forecastframe$TotalSales.ff<-forecastframe$SystemSales.ff+forecastframe$ExtendedSales.ff
+forecastframe$TotalSales_NL.ff<-forecastframe$SystemSales_NL.ff+forecastframe$ExtendedSales.ff
+forecastframe$TotalSales_exHalsey.ff<-forecastframe$SystemSales.ff+forecastframe$Camas.ff
+forecastframe$TotalSales_NL_exHalsey.ff<-forecastframe$SystemSales_NL.ff+forecastframe$Camas.ff
+forecastframe$TotalSales_exCamas.ff<-forecastframe$SystemSales.ff+forecastframe$Halsey.ff
+forecastframe$TotalSales_NL_exCamas.ff<-forecastframe$SystemSales_NL.ff+forecastframe$Halsey.ff
+
+forecastframe$Residential.ff<-forecastframe$nonWaunaSystem.ff * forecastframe$ressplit
+forecastframe$Commercial.ff<-forecastframe$nonWaunaSystem.ff * forecastframe$comsplit
+
+forecastframe$SystemSales.ee<-forecastframe$nonWaunaSystem.ee+forecastframe$Biorefinery.ee+forecastframe$Wauna.ee
+forecastframe$ExtendedSales.ee<-forecastframe$Halsey.ee+forecastframe$Camas.ee
+forecastframe$TotalSales.ee<-forecastframe$SystemSales.ee+forecastframe$ExtendedSales.ee
+forecastframe$TotalSales_exHalsey.ee<-forecastframe$SystemSales.ee+forecastframe$Camas.ee
+
+testdata<-merge(testdata, forecastframe,by.x=c("Dy", "Load_hour"), by.y=c("MonYr", "Load_hour"), all.x=T)
+
+```
+
+#Summary tables
+```{r summary_tbls}
+camfactor<-mean(forecastframe$Camas_LF, na.rm=T) #Need this outside pipes because it's grouped on months, and we only have a few months
+
+
+testmonframe<-testdata %>%
+        group_by(Month=Dy) %>%
+        summarise(rescom_aMW=weighted.mean(nonWaunaSystem,Count_Hours),
+                  Bio_aMW=weighted.mean(Biorefinery,Count_Hours),
+                  Wau_aMW=weighted.mean(Wauna,Count_Hours),
+                  Hal_aMW=weighted.mean(Halsey,Count_Hours),
+                  Camas_aMW=weighted.mean(Camas,Count_Hours),
+                  System_aMW=weighted.mean(SystemSales,Count_Hours),
+                  Total_aMW=weighted.mean(TotalSales,Count_Hours),
+                  TotalexHalsey_aMW = weighted.mean(TotalSales_exHalsey,Count_Hours))
+
+
+fcstmonframe<-forecastframe %>%
+        group_by(Month=MonYr, out) %>%
+        summarise(rescom_aMW=weighted.mean(nonWaunaSystem.ff,Count_Hours),
+                  rescom_MW=max(nonWaunaSystem.ff) / mean(nonWaunaSystem_LF),
+                  res_aMW=weighted.mean(nonWaunaSystem.ff,Count_Hours) * mean(ressplit),
+                  res_MW= (max(nonWaunaSystem.ff) / mean(nonWaunaSystem_LF)) * mean(ressplit),
+                  com_aMW=weighted.mean(nonWaunaSystem.ff,Count_Hours) * mean(comsplit),
+                  com_MW= (max(nonWaunaSystem.ff) / mean(nonWaunaSystem_LF)) * mean(comsplit),
+                  Bio_aMW=weighted.mean(Biorefinery.ff,Count_Hours),
+                  Bio_MW= max(Biorefinery.ff) / mean(Biorefinery_LF),
+                  Wau_aMW=weighted.mean(Wauna.ff,Count_Hours),
+                  Wau_MW= max(Wauna.ff) / mean(Wauna_LF), 
+                  Hal_aMW=weighted.mean(Halsey.ff,Count_Hours),
+                  Hal_MW= max(Halsey.ff) / mean(Halsey_LF),
+                  Camas_aMW=weighted.mean(Camas.ff,Count_Hours),
+                  Camas_MW= max(Camas.ff) / camfactor,
+                  System_aMW=weighted.mean(SystemSales.ff,Count_Hours),
+                  System_MW= max(SystemSales.ff) / mean(Sys_LF),
+                  System_NL_aMW=weighted.mean(SystemSales_NL.ff,Count_Hours),
+                  System_NL_MW= (max(SystemSales.ff) / mean(Sys_LF))+(max(Newload.ff) / mean(Newload_LF)),
+                  Total_aMW=weighted.mean(TotalSales.ff,Count_Hours),
+                  Total_MW =max(TotalSales.ff) / mean(Total_LF),
+                  Total_NL_aMW=weighted.mean(TotalSales_NL.ff,Count_Hours),
+                  Total_NL_MW =(max(TotalSales.ff) / mean(Total_LF))+(max(Newload.ff) /  mean(Newload_LF)),
+                  TotalexHalsey_aMW = weighted.mean(TotalSales_exHalsey.ff,Count_Hours) ,
+                  TotalexHalsey_MW = max(TotalSales_exHalsey.ff) / mean(Total_exHalsey_LF),
+                  Total_NL_exHalsey_aMW = weighted.mean(TotalSales_NL_exHalsey.ff,Count_Hours) ,
+                  Total_NL_exHalsey_MW = (max(TotalSales_exHalsey.ff) / mean(Total_exHalsey_LF))+(max(Newload.ff) /  mean(Newload_LF)),
+                  TotalexCamas_aMW = weighted.mean(TotalSales_exCamas.ff,Count_Hours) ,
+                  TotalexCamas_MW = max(TotalSales_exCamas.ff) / mean(Total_exCamas_LF), 
+                  Total_NL_exCamas_aMW = weighted.mean(TotalSales_NL_exCamas.ff,Count_Hours) ,
+                  Total_NL_exCamas_MW = (max(TotalSales_exCamas.ff) / mean(Total_exCamas_LF))+(max(Newload.ff) /  mean(Newload_LF)), 
+                  WaunaOut = weighted.mean(WaunaOut,Count_Hours),
+                  rescom.ee_aMW=weighted.mean(nonWaunaSystem.ee,Count_Hours),
+                  rescom.ee_MW=max(nonWaunaSystem.ee) / mean(nonWaunaSystem_LF),
+                  res.ee_aMW=weighted.mean(nonWaunaSystem.ee,Count_Hours) * mean(ressplit),
+                  res.ee_MW= (max(nonWaunaSystem.ee) / mean(nonWaunaSystem_LF)) * mean(ressplit),
+                  com.ee_aMW=weighted.mean(nonWaunaSystem.ee,Count_Hours) * mean(comsplit),
+                  com.ee_MW= (max(nonWaunaSystem.ee) / mean(nonWaunaSystem_LF)) * mean(comsplit),
+                  Bio.ee_aMW=weighted.mean(Biorefinery.ee,Count_Hours),
+                  Bio.ee_MW= max(Biorefinery.ee) / mean(Biorefinery_LF),
+                  Wau.ee_aMW=weighted.mean(Wauna.ee,Count_Hours),
+                  Wau.ee_MW= max(Wauna.ee) / mean(Wauna_LF), 
+                  Hal.ee_aMW=weighted.mean(Halsey.ee,Count_Hours),
+                  Hal.ee_MW= max(Halsey.ee) / mean(Halsey_LF),
+                  Camas.ee_aMW=weighted.mean(Camas.ee,Count_Hours),
+                  Camas.ee_MW= max(Camas.ee) / camfactor,
+                  System.ee_aMW=weighted.mean(SystemSales.ee,Count_Hours),
+                  System.ee_MW= max(SystemSales.ee) / mean(Sys_LF),
+                  Total.ee_aMW=weighted.mean(TotalSales.ee,Count_Hours),
+                  Total.ee_MW =max(TotalSales.ee) / mean(Total_LF),
+                  TotalexHalsey.ee_aMW = weighted.mean(TotalSales_exHalsey.ee,Count_Hours) ,
+                  TotalexHalsey.ee_MW = max(TotalSales_exHalsey.ee) / mean(Total_exHalsey_LF))
+
+fcstyrframe<-forecastframe %>%
+        group_by(Year=year(MonYr)) %>%
+        summarise(f.Res_aMW=weighted.mean(nonWaunaSystem.f,Count_Hours),
+                  f1.Res_aMW=weighted.mean(nonWaunaSystem.f1,Count_Hours),
+                  f2.Res_aMW=weighted.mean(nonWaunaSystem.f2,Count_Hours),
+                  ff.Res_aMW=weighted.mean(nonWaunaSystem.ff,Count_Hours),
+                  f.Wauna_aMW=weighted.mean(Wauna.f,Count_Hours),
+                  f1.Wauna_aMW=weighted.mean(Wauna.f1,Count_Hours),
+                  f2.Wauna_aMW=weighted.mean(Wauna.f2,Count_Hours),
+                  ff.Wauna_aMW=weighted.mean(Wauna.ff,Count_Hours),
+                  f.Halsey_aMW=weighted.mean(Halsey.f,Count_Hours),
+                  f1.Halsey_aMW=weighted.mean(Halsey.f1,Count_Hours),
+                  f2.Halsey_aMW=weighted.mean(Halsey.f2,Count_Hours),
+                  ff.Halsey_aMW=weighted.mean(Halsey.ff,Count_Hours),
+                  f.Camas_aMW=weighted.mean(Camas.f,Count_Hours),
+                  f1.Camas_aMW=weighted.mean(Camas.f1,Count_Hours),
+                  f2.Camas_aMW=weighted.mean(Camas.f2,Count_Hours),
+                  ff.Camas_aMW=weighted.mean(Camas.ff,Count_Hours),
+                  f.Biorefinery_aMW=weighted.mean(Biorefinery.f,Count_Hours),
+                  f1.Biorefinery_aMW=weighted.mean(Biorefinery.f1,Count_Hours),
+                  f2.Biorefinery_aMW=weighted.mean(Biorefinery.f2,Count_Hours),
+                  ff.Biorefinery_aMW=weighted.mean(Biorefinery.ff,Count_Hours),
+                  System_aMW=weighted.mean(SystemSales.ff,Count_Hours),
+                  Extended_aMW=weighted.mean(ExtendedSales.ff,Count_Hours),
+                  Total_aMW=weighted.mean(TotalSales.ff,Count_Hours),
+                  System_MWh=weighted.mean(SystemSales.ff,Count_Hours)*sum(Count_Hours),
+                  Extended_MWh=weighted.mean(ExtendedSales.ff,Count_Hours)*sum(Count_Hours),
+                  Total_MWh=weighted.mean(TotalSales.ff,Count_Hours)*sum(Count_Hours),
+                  Total_aMW_exHalsey=weighted.mean(TotalSales_exHalsey.ff,Count_Hours),
+                  Total_MWh_exHalsey=weighted.mean(TotalSales_exHalsey.ff,Count_Hours)*sum(Count_Hours),
+                  Hours=sum(Count_Hours), 
+                  EE_exHalsey=weighted.mean(nonWaunaSystem.ee+Wauna.ee, Count_Hours)) 
+
+
+#Historic aMW by year
+histyrframe<-loaddata %>%
+        group_by(Year=year(Dy)) %>%
+        summarise(Res_aMW=weighted.mean(nonWaunaSystem,TotHrs),
+                  Res_aMW.n1=weighted.mean(nonWaunaSystem.n1,TotHrs),
+                  Res_aMW.n2=weighted.mean(nonWaunaSystem.n2,TotHrs),
+                  Wauna_aMW=weighted.mean(Wauna,TotHrs),
+                  Wauna_aMW.n1=weighted.mean(Wauna.n1,TotHrs),
+                  Wauna_aMW.n2=weighted.mean(Wauna.n2,TotHrs),
+                  Halsey_aMW=weighted.mean(Halsey,TotHrs),
+                  Halsey_aMW.n1=weighted.mean(Halsey.n1,TotHrs),
+                  Halsey_aMW.n2=weighted.mean(Halsey.n2,TotHrs),
+                  Camas_aMW=weighted.mean(Camas,TotHrs),
+                  Camas_aMW.n1=weighted.mean(Camas.n1,TotHrs),
+                  Camas_aMW.n2=weighted.mean(Camas.n2,TotHrs),
+                  Biorefinery_aMW=weighted.mean(Biorefinery, TotHrs),
+                  Biorefinery_aMW.n1=weighted.mean(Biorefinery.n1, TotHrs),
+                  Biorefinery_aMW.n2=weighted.mean(Biorefinery.n2, TotHrs),
+                  HDD=sum(HDD),
+                  CDD=sum(CDD)) %>%
+        mutate(System_aMW=Res_aMW+Wauna_aMW+Biorefinery_aMW,
+               System_aMW.n=Res_aMW.n2+Wauna_aMW.n2+Biorefinery_aMW.n2)
+
+#Historic aMW by year
+histmonframe<-loaddata %>%
+        group_by(Month=Dy)  %>%
+        summarise(Res_aMW=weighted.mean(nonWaunaSystem,TotHrs),
+                  Res_aMW.n1=weighted.mean(nonWaunaSystem.n1,TotHrs),
+                  Res_aMW.n2=weighted.mean(nonWaunaSystem.n2,TotHrs),
+                  Wauna_aMW=weighted.mean(Wauna,TotHrs),
+                  Wauna_aMW.n1=weighted.mean(Wauna.n1,TotHrs),
+                  Wauna_aMW.n2=weighted.mean(Wauna.n2,TotHrs),
+                  Halsey_aMW=weighted.mean(Halsey,TotHrs),
+                  Halsey_aMW.n1=weighted.mean(Halsey.n1,TotHrs),
+                  Halsey_aMW.n2=weighted.mean(Halsey.n2,TotHrs),
+                  Camas_aMW=weighted.mean(Camas,TotHrs),
+                  Camas_aMW.n1=weighted.mean(Camas.n1,TotHrs),
+                  Camas_aMW.n2=weighted.mean(Camas.n2,TotHrs),
+                  Biorefinery_aMW=weighted.mean(Biorefinery, TotHrs),
+                  Biorefinery_aMW.n1=weighted.mean(Biorefinery.n1, TotHrs),
+                  Biorefinery_aMW.n2=weighted.mean(Biorefinery.n2, TotHrs),
+                  HDD=sum(HDD),
+                  CDD=sum(CDD)) %>%
+        mutate(System_aMW=Res_aMW+Wauna_aMW+Biorefinery_aMW,
+               System_aMW.n=Res_aMW.n2+Wauna_aMW.n2+Biorefinery_aMW.n2,
+               Total_aMW=Res_aMW+Wauna_aMW+Biorefinery_aMW+Halsey_aMW+Camas_aMW)
+
+n.histmonframe<-loaddata[loaddata$Dy >= "2009-01-01",] %>%
+        group_by(Month=month(Dy))  %>%
+        summarise(Res_aMW=weighted.mean(nonWaunaSystem,TotHrs),
+                  Res_aMW.n1=weighted.mean(nonWaunaSystem.n1,TotHrs),
+                  Res_aMW.n2=weighted.mean(nonWaunaSystem.n2,TotHrs),
+                  Wauna_aMW=weighted.mean(Wauna,TotHrs),
+                  Wauna_aMW.n1=weighted.mean(Wauna.n1,TotHrs),
+                  Wauna_aMW.n2=weighted.mean(Wauna.n2,TotHrs),
+                  Halsey_aMW=weighted.mean(Halsey,TotHrs),
+                  Halsey_aMW.n1=weighted.mean(Halsey.n1,TotHrs),
+                  Halsey_aMW.n2=weighted.mean(Halsey.n2,TotHrs),
+                  Camas_aMW=weighted.mean(Camas,TotHrs),
+                  Camas_aMW.n1=weighted.mean(Camas.n1,TotHrs),
+                  Camas_aMW.n2=weighted.mean(Camas.n2,TotHrs),
+                  Biorefinery_aMW=weighted.mean(Biorefinery, TotHrs),
+                  Biorefinery_aMW.n1=weighted.mean(Biorefinery.n1, TotHrs),
+                  Biorefinery_aMW.n2=weighted.mean(Biorefinery.n2, TotHrs))  %>%
+        mutate(System_aMW=Res_aMW+Wauna_aMW+Biorefinery_aMW,
+               System_aMW.n=Res_aMW.n2+Wauna_aMW.n2+Biorefinery_aMW.n2,
+               Total_aMW=Res_aMW+Wauna_aMW+Biorefinery_aMW+Halsey_aMW+Camas_aMW)
+
+
+#Max in summary because it's cumulative? Max gets the end of the year
+#actually the vector I used... it was % with CADF
+eeforecast<-forecastframe %>%
+                    group_by(Year=year(MonYr)) %>%
+                    summarise(Res_ee=max(nonWaunaSystem.ee),
+                            Wauna_ee=max(Wauna.ee),
+                            Halsey_ee=max(Halsey.ee),
+                            Biorefinery_ee=max(Biorefinery.ee)) %>%
+                    mutate(ee_exHalsey=Res_ee+Wauna_ee+Biorefinery_ee,
+                           Total_ee=Res_ee+Wauna_ee+Biorefinery_ee+Halsey_ee)
+
+
+temptestframe<-testdata %>%
+        group_by(Month=Dy) %>%
+        summarise(HDD=sum(HDD.x),
+                  CDD=sum(CDD.x),
+                  N_HDD=sum(N_HDD),
+                  N_CDD=sum(N_CDD))
+
+```
+
+#Output
+```{r output}
+#NO LONGER AUTOMATICALLY IMPORTED TO SQL
+#RUN SQL IMPORT MANUALLY TO IMPORT
+
+#Create and write Outputframe
+outputframe<-forecastframe %>%
+        melt(id.vars=c("MonYr",
+                       "Load_hour",
+                       "Count_Hours"),
+             measure.vars = c("nonWaunaSystem.ff",
+                              "Wauna.ff",
+                              "Biorefinery.ff",
+                              "Halsey.ff",
+                              "Camas.ff",
+                              "Newload.ff",
+                              "Residential.ff",
+                              "Commercial.ff")) %>%
+        transmute(MonYr=MonYr,
+                  Load_hour,
+                  Rundate=as.Date(Sys.time()),
+                  Variable=gsub(".ff", "", variable),
+                  Unit="MWh",
+                  Quantity=round(value * Count_Hours, digits=0)
+                  )
+
+outputframe2<-fcstmonframe %>%
+         melt(id.vars=c("Month"),
+             measure.vars = c("rescom_MW",
+                              "res_MW",
+                              "com_MW",
+                              "Bio_MW",
+                              "Wau_MW",
+                              "Hal_MW",
+                              "Camas_MW",
+                              "Total_MW"
+                              )) %>%
+        transmute(MonYr=Month,
+                  Load_hour="MT",
+                  Rundate=as.Date(Sys.time()),
+                  Variable=gsub("_MW", "", variable),
+                  Unit="MW",
+                  Quantity=(value)
+                  )
+outputframe2[outputframe2$Variable == "rescom",]$Variable="nonWaunaSystem"
+outputframe2[outputframe2$Variable == "com",]$Variable="Commercial"
+outputframe2[outputframe2$Variable == "res",]$Variable="Residential"
+outputframe2[outputframe2$Variable == "Bio",]$Variable="Biorefinery"
+outputframe2[outputframe2$Variable == "Wau",]$Variable="Wauna"
+outputframe2[outputframe2$Variable == "Hal",]$Variable="Halsey"
+outputframe2[outputframe2$Variable == "Total",]$Variable="Total_System"
+
+outputframe<-rbind(outputframe, outputframe2)
+
+outputframe$Chg_cd<-NA
+
+#MWh
+outputframe[outputframe$Variable=="nonWaunaSystem" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh", 7] <- 441.00001
+outputframe[outputframe$Variable=="Biorefinery" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh", 7]<-442.20401
+outputframe[outputframe$Variable=="Wauna" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh",7]<-442.20201
+outputframe[outputframe$Variable=="Halsey" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh",7]<-442.20301
+outputframe[outputframe$Variable=="Camas" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh",7]<-442.20501
+outputframe[outputframe$Variable=="Newload" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh",7]<-442.20901
+outputframe[outputframe$Variable=="Residential" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh",7]<-440.30001
+outputframe[outputframe$Variable=="Commercial" & outputframe$Load_hour=="HLH" & outputframe$Unit=="MWh",7]<-442.10001
+
+outputframe[outputframe$Variable=="nonWaunaSystem" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-441.00002
+outputframe[outputframe$Variable=="Biorefinery" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-442.20402
+outputframe[outputframe$Variable=="Wauna" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-442.20202
+outputframe[outputframe$Variable=="Halsey" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-442.20302
+outputframe[outputframe$Variable=="Camas" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-442.20502
+outputframe[outputframe$Variable=="Newload" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-442.20902
+outputframe[outputframe$Variable=="Residential" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-440.30002
+outputframe[outputframe$Variable=="Commercial" & outputframe$Load_hour=="LLH" & outputframe$Unit=="MWh",7]<-442.10002
+
+#MW
+outputframe[outputframe$Variable=="nonWaunaSystem" & outputframe$Unit=="MW", 7] <- 441.00003
+outputframe[outputframe$Variable=="Biorefinery" & outputframe$Unit=="MW", 7]<-442.20403
+outputframe[outputframe$Variable=="Wauna" & outputframe$Unit=="MW",7]<-442.20203
+outputframe[outputframe$Variable=="Halsey" & outputframe$Unit=="MW",7]<-442.20303
+outputframe[outputframe$Variable=="Camas" & outputframe$Unit=="MW",7]<-442.20503
+outputframe[outputframe$Variable=="Newload" & outputframe$Unit=="MW",7]<-442.20903
+outputframe[outputframe$Variable=="Residential" & outputframe$Unit=="MW",7]<-440.30003
+outputframe[outputframe$Variable=="Commercial" & outputframe$Unit=="MW",7]<-442.10003
+
+outputframe[outputframe$Variable=="Total_System" & outputframe$Unit=="MW",7]<-555.51503
+
+write.csv(outputframe, file="\\\\itv00006\\sqlupload$\\Load_Forecast_Output.csv", row.names=FALSE, quote=F)
+
+write.csv(fcstmonframe, file="\\\\itv00005\\Power\\Data_Systems\\R\\Load Forecast\\Forecast_Mon_Output.csv",row.names=FALSE, quote=F)
+
+write.csv(testdata, file="\\\\itv00005\\Power\\Data_Systems\\R\\Load Forecast\\Forecast_Testdata_Output.csv",row.names=FALSE, quote=F)
+
+```
+
+
+
+<!-- EVERYTHING AFTER THIS IS SUMMARY? -->
+#Summary stats
+```{r model_stats}
+cat("MAPE RES:",MAPE(testdata$nonWaunaSystem.ff, testdata$nonWaunaSystem), "MAE RES:",MAE(testdata$nonWaunaSystem.ff, testdata$nonWaunaSystem), "\n")
+    #LM#MAPE RES: 0.1606902 MAE RES: 1.742918
+    #RF#MAPE RES: 0.1485457 MAE RES: 1.589138
+    #BT#MAPE RES: 0.1483428 MAE RES: 1.587922
+    #3# MAPE RES: 0.1139944 MAE RES: 1.100117
+    #3rfMAPE RES: 0.1162221 MAE RES: 1.170477
+    #3gbMAPE RES: 0.1043569 MAE RES: 0.9677615
+cat("MAPE Wauna:",MAPE(testdata$Wauna.ff, testdata$Wauna),"MAE Wauna:",MAE(testdata$Wauna.ff, testdata$Wauna), "\n")
+    #LM#MAPE Wauna: 0.01908549 MAE Wauna: 1.317637
+    #RF#MAPE Wauna: 0.0211639 MAE Wauna: 1.467565
+    #BT#MAPE Wauna: 0.01931652 MAE Wauna: 1.333077
+    #3lm-bad
+    #3rfMAPE Wauna: 0.01932634 MAE Wauna: 1.290416 (mtry=3, ntrees=501)
+    #3btMAPE Wauna: 0.02786049 MAE Wauna: 1.845468
+cat("MAPE Halsey:",MAPE(testdata$Halsey.ff, testdata$Halsey),"MAE Halsey:",MAE(testdata$Halsey.ff, testdata$Halsey), "\n")
+    #LM#MAPE Halsey: 0.121292 MAE Halsey: 2.004427
+    #RF#MAPE Halsey: 0.1152337 MAE Halsey: 1.903316
+    #BT#MAPE Halsey: 0.1215458 MAE Halsey: 2.008466
+    #3lmMAPE Halsey: 0.0788588 MAE Halsey: 1.341755
+    #3rfMAPE Halsey: 0.08069552 MAE Halsey: 1.392528
+    #3btMAPE Halsey: 0.09871519 MAE Halsey: 1.674252
+```
+#Annual aMW Plots
+```{r plots1}
+# #Plot annual aMW
+
+#RES
+ggplot() +
+  geom_line(data=fcstyrframe, aes(x=Year, y=ff.Res_aMW, color="Forecast.Final"),size=2) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f.Res_aMW, color="Forecast.Raw")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f1.Res_aMW, color="Forecast.Trended")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f2.Res_aMW, color="Forecast.Trend&EE")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Res_aMW, color="Hist.Actual")) +       
+  geom_line(data=histyrframe, aes(x=Year, y=Res_aMW.n1, color="Hist.EE_Removed")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Res_aMW.n2, color="Hist.EE&Trend_Removed")) +
+  labs(title="Annual ResCom Comparison", x="Year", y="aMW") +
+  theme_bw()
+ 
+  # scale_color_manual(values = c(
+   #                                'Y1' = 'darkblue',
+   #                                'Y2' = 'red',
+   #                                'Hist.Norma)) +
+
+#WAUNA
+ggplot() +
+  geom_line(data=fcstyrframe, aes(x=Year, y=ff.Wauna_aMW, color="Forecast.Final"),size=2) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f.Wauna_aMW, color="Forecast.Raw")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f1.Wauna_aMW, color="Forecast.Trended")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f2.Wauna_aMW, color="Forecast.Trend&EE")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Wauna_aMW, color="Hist.Actual")) + 
+  geom_line(data=histyrframe, aes(x=Year, y=Wauna_aMW.n1, color="Hist.EE_Removed")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Wauna_aMW.n2, color="Hist.EE&Trend_Removed")) +
+  labs(title="Annual Wauna Comparison", x="Year", y="aMW") +
+  theme_bw()
+
+#Trying to figure out why first year of forecast so low. (has to do with EE)
+# ggplot() +
+#   geom_line(data=fcstyrframe, aes(x=Year, y=f.Wauna_aMW, color="Raw.Forecast"))
+# 
+# ggplot() +
+#   geom_line(data=fcstyrframe, aes(x=Year, y=f1.Wauna_aMW, color="Trended.Forecast"))
+
+# ggplot() +
+#   geom_line(data=fcstyrframe, aes(x=Year, y=f2.Wauna_aMW, color="Trend&EE.Forecast"))
+
+
+#HALSEY
+ggplot() +
+  geom_line(data=fcstyrframe, aes(x=Year, y=ff.Halsey_aMW, color="Forecast.Final"),size=2) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f.Halsey_aMW, color="Forecast.Raw")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f1.Halsey_aMW, color="Forecast.Trended")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f2.Halsey_aMW, color="Forecast.Trend&EE")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Halsey_aMW, color="Hist.Actual")) +    
+  geom_line(data=histyrframe, aes(x=Year, y=Halsey_aMW.n1, color="Hist.EE_Removed")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Halsey_aMW.n2, color="Hist.EE&Trend_Removed")) +
+  labs(title="Annual Halsey Comparison", x="Year", y="aMW") +
+  theme_bw()
+
+#BIO
+ggplot() +
+  geom_line(data=fcstyrframe, aes(x=Year, y=ff.Biorefinery_aMW, color="Forecast.Final"),size=2) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f.Biorefinery_aMW, color="Forecast.Raw")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f1.Biorefinery_aMW, color="Forecast.Trended")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f2.Biorefinery_aMW, color="Forecast.Trend&EE")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Biorefinery_aMW, color="Hist.Actual")) +       
+  geom_line(data=histyrframe, aes(x=Year, y=Biorefinery_aMW.n1, color="Hist.EE_Removed"), na.rm=TRUE) +
+  geom_line(data=histyrframe, aes(x=Year, y=Biorefinery_aMW.n2, color="Hist.EE&Trend_Removed"), na.rm=TRUE) +
+  labs(title="Annual Biorefinery Comparison", x="Year", y="aMW") +
+  theme_bw() 
+
+#CAMAS
+ggplot() +
+  geom_line(data=fcstyrframe, aes(x=Year, y=ff.Camas_aMW, color="Forecast.Final"),size=2) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f.Camas_aMW, color="Forecast.Raw")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f1.Camas_aMW, color="Forecast.Trended")) +
+  geom_line(data=fcstyrframe, aes(x=Year, y=f2.Camas_aMW, color="Forecast.Trend&EE")) +
+  geom_line(data=histyrframe, aes(x=Year, y=Camas_aMW, color="Hist.Actual"), na.rm=TRUE) +  
+  geom_line(data=histyrframe, aes(x=Year, y=Camas_aMW.n1, color="Hist.EE&Trend_Removed"), na.rm=TRUE) +
+  geom_line(data=histyrframe, aes(x=Year, y=Camas_aMW.n2, color="Hist.EE&Trend_Removed"), na.rm=TRUE) +
+  labs(title="Annual Camas Comparison", x="Year", y="aMW") +
+  theme_bw()
+
+
+ggplot() +
+      geom_line(data=fcstyrframe, aes(x=Year, y=System_aMW, color="Forecast")) +
+      geom_line(data=histyrframe, aes(x=Year, y=System_aMW, color="Hist")) +
+      labs(title="CLSK System aMW", x="Year", y="aMW") +
+      theme_bw()
+       
+ggplot(data=fcstyrframe, aes(x=Year, y=Total_aMW))+
+      geom_line() + 
+      labs(title="CLSK Total aMW", x="Year", y="aMW") +
+      theme_bw()
+
+ggplot(data=fcstyrframe, aes(x=Year, y=Extended_aMW)) +
+      geom_line() +
+      labs(title="Extended aMW", x="Year", y="aMW") +
+      theme_bw()
+
+ggplot(data=fcstyrframe, aes(x=Year, y=Total_aMW_exHalsey)) +
+      geom_line() +
+      labs(title="CLSK Total aMW excl. Halsey", x="Year", y="aMW") +
+      theme_bw()
+
+
+```
+
+#Monthly aMW Plots
+```{r plots2}
+#Plot monthly aMW
+
+#RES
+plt.res.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=nonWaunaSystem.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=nonWaunaSystem.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=nonWaunaSystem.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=nonWaunaSystem.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=nonWaunaSystem, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=nonWaunaSystem.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly HLH ResCom Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.res.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=nonWaunaSystem.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=nonWaunaSystem.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=nonWaunaSystem.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=nonWaunaSystem.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=nonWaunaSystem, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=nonWaunaSystem.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly LLH ResCom Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.res.hlh, plt.res.llh, align = "hv", ncol = 1, nrow = 2)
+
+# scale_color_manual(values = c(
+#                                'Y1' = 'darkblue',
+#                                'Y2' = 'red',
+#                                'Hist.Norma)) +
+
+#Wauna
+plt.wau.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Wauna.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Wauna.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Wauna.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Wauna.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Wauna, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Wauna.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly HLH Wauna Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.wau.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Wauna.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Wauna.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Wauna.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Wauna.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Wauna, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Wauna.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly LLH Wauna Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.wau.hlh, plt.wau.llh, align = "hv", ncol = 1, nrow = 2)
+
+#Halsey
+plt.hal.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Halsey.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Halsey.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Halsey.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Halsey.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Halsey, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Halsey.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly HLH Halsey Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.hal.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Halsey.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Halsey.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Halsey.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Halsey.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Halsey, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Halsey.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly LLH Halsey Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.hal.hlh, plt.hal.llh, align = "hv", ncol = 1, nrow = 2)
+
+#BIO
+plt.bio.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Biorefinery.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Biorefinery.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Biorefinery.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Biorefinery.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH" & year(loaddata$Dy) > 2015,], aes(x=Dy, y=Biorefinery, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH" & year(loaddata$Dy) > 2015,], aes(x=Dy, y=Biorefinery.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly HLH Biorefinery Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.bio.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Biorefinery.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Biorefinery.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Biorefinery.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Biorefinery.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH" & year(loaddata$Dy) > 2015,], aes(x=Dy, y=Biorefinery, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH" & year(loaddata$Dy) > 2015,], aes(x=Dy, y=Biorefinery.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly LLH ResCom Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.bio.hlh, plt.bio.llh, align = "hv", ncol = 1, nrow = 2)
+
+#Camas
+plt.cam.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Camas.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Camas.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Camas.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Camas.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Camas, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Camas.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly HLH Camas Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.cam.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Camas.ff, color="Final.Forecast"),size=2) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Camas.f, color="Raw.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Camas.f1, color="Trended.Forecast")) +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Camas.f2, color="Trend&EE.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Camas, color="Hist.Actual")) +       
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Camas.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly LLH Camas Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.cam.hlh, plt.cam.llh, align = "hv", ncol = 1, nrow = 2)
+
+```
+#Monthly aMW Plots2
+```{r plots2.1}
+#Plot monthly aMW
+
+#RES
+plt.res.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=nonWaunaSystem.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=nonWaunaSystem.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly HLH ResCom Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.res.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=nonWaunaSystem.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=nonWaunaSystem.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly LLH ResCom Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.res.hlh, plt.res.llh, align = "hv", ncol = 1, nrow = 2)
+
+#Wauna
+plt.wau.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Wauna.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Wauna.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly HLH Wauna Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.wau.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Wauna.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Wauna.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly LLH Wauna Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.wau.hlh, plt.wau.llh, align = "hv", ncol = 1, nrow = 2)
+
+#Halsey
+plt.hal.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Halsey.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Halsey.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly HLH Halsey Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.hal.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Halsey.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Halsey.n2, color="Hist.Normalized")) +
+                  labs(title="Monthly LLH Halsey Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.hal.hlh, plt.hal.llh, align = "hv", ncol = 1, nrow = 2)
+
+#BIO
+plt.bio.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Biorefinery.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH" & year(loaddata$Dy) > 2015,], aes(x=Dy, y=Biorefinery.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly HLH Biorefinery Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.bio.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Biorefinery.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH" & year(loaddata$Dy) > 2015,], aes(x=Dy, y=Biorefinery.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly LLH ResCom Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.bio.hlh, plt.bio.llh, align = "hv", ncol = 1, nrow = 2)
+
+#Camas
+plt.cam.hlh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="HLH",], aes(x=MonYr, y=Camas.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="HLH",], aes(x=Dy, y=Camas.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly HLH Camas Comparison", x="Year", y="aMW") +
+                  theme_bw()
+plt.cam.llh <- ggplot() +
+                  geom_line(data=forecastframe[forecastframe$Load_hour=="LLH",], aes(x=MonYr, y=Camas.ff, color="Final.Forecast")) +
+                  geom_line(data=loaddata[loaddata$Load_hour=="LLH",], aes(x=Dy, y=Camas.n2, color="Hist.Normalized"), na.rm=TRUE) +
+                  labs(title="Monthly LLH Camas Comparison", x="Year", y="aMW") +
+                  theme_bw()
+ggarrange(plt.cam.hlh, plt.cam.llh, align = "hv", ncol = 1, nrow = 2)
+```
+
+#Monthly Peak Forecast vs. Actual
+```{r plots3}
+#Peak forecast vs. actual
+
+#ResCom
+res.pk<-ggplot() +
+            geom_line(data=fcstmonframe[fcstmonframe$Month<=floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=rescom_MW, color="Forecast"),size=1) +
+            geom_line(data=peakactuals, aes(x=MonthYear, y=ResComPeak, color="Actual")) +
+            labs(title="ResCom Peak Comparison", x="Month", y="MW") +
+            scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$rescom_MW)) +
+            theme_bw()
+
+# ggarrange(res.pk, temp.plt, align = "hv", ncol = 1, nrow = 2)
+res.pk
+
+#Wauna
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=Wau_MW, color="Forecast"),size=1) +
+      geom_line(data=peakactuals, aes(x=MonthYear, y=WaunaPeak, color="Actual")) +
+      labs(title="Wauna Peak Comparison", x="Month", y="MW") +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Wau_MW)) +
+      theme_bw()
+
+#Halsey
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=Hal_MW, color="Forecast"),size=1) +
+      geom_line(data=peakactuals, aes(x=MonthYear, y=HalseyPeak, color="Actual")) +
+      labs(title="Halsey Peak Comparison", x="Month", y="MW") +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Hal_MW)) +
+      theme_bw()
+
+#Camas
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=Camas_MW, color="Forecast"),size=1) +
+      geom_line(data=peakactuals, aes(x=MonthYear, y=CamasPeak, color="Actual")) +
+      labs(title="Camas Peak Comparison", x="Month", y="MW") +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Camas_MW)) +
+      theme_bw()
+
+#Biorefinery
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=Bio_MW, color="Forecast"),size=1) +
+      geom_line(data=peakactuals, aes(x=MonthYear, y=BioPeak, color="Actual")) +
+      labs(title="Biorefinery Peak Comparison", x="Month", y="MW") +
+      theme_bw()
+
+#System
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=System_MW, color="Forecast"),size=1) +
+      geom_line(data=peakactuals, aes(x=MonthYear, y=SystemPeak, color="Actual")) +
+      labs(title="System Peak Comparison", x="Month", y="MW") +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$System_MW)) +
+      theme_bw()
+
+#Total
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=Month, y=Total_MW, color="Forecast"),size=1) +
+      geom_line(data=peakactuals, aes(x=MonthYear, y=TotalPeak, color="Actual")) +
+      labs(title="Total Peak Comparison", x="Month", y="MW") +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Total_MW)) +
+      theme_bw()
+
+
+```
+
+
+#Monthly Energy Forecast vs. Actual
+```{r plots4}
+#Energy forecast vs. actual
+
+
+#ResCom
+res.amw<-ggplot() +
+            geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=rescom_aMW, color="Forecast"),size=1) +
+            geom_line(data=testmonframe[testmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=rescom_aMW, color="Actual")) +
+            geom_line(data=n.histmonframe, aes(x=Month, y=Res_aMW.n2, color="Avg")) +
+            scale_x_continuous(breaks=seq(1:12)) +
+            labs(title="ResCom aMW Comparison", x="Month", y="aMW") +
+            scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$rescom_aMW)) +
+            theme_bw()
+temp.plt<-ggplot(data=temptestframe[temptestframe$Month<floor_date(Sys.Date(), unit="months"),]) +
+            geom_line(aes(x=month(Month), y=N_HDD, color="HDD Forecast"),size=1) +
+            geom_line(aes(x=month(Month), y=N_CDD, color="CDD Forecast"),size=1) +
+            geom_line(aes(x=month(Month), y=HDD, color="HDD Actual"),size=1) +
+            geom_line(aes(x=month(Month), y=CDD, color="CDD Actual"),size=1) +
+            scale_x_continuous(breaks=seq(1:12), limits=c(1,12)) +
+            labs(title="Temp Actual/Forecast Comparison", x="Month", y="Degree Days") +
+            theme_bw()
+
+ggarrange(res.amw, temp.plt, align = "hv", ncol = 1, nrow = 2)
+
+
+#Wauna
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=Wau_aMW, color="Forecast"),size=2) +
+      geom_line(data=testmonframe, aes(x=month(Month), y=Wau_aMW, color="Actual"),size=2) +
+      geom_line(data=n.histmonframe, aes(x=Month, y=Wauna_aMW.n2, color="n.Avg")) +
+      geom_line(data=histmonframe[year(histmonframe$Month)==2018,], aes(x=month(Month), y=Wauna_aMW.n2, color="2018")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL, breaks=all_int_breaks(fcstmonframe$Wau_aMW)) + 
+      labs(title="Wauna aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Halsey
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=Hal_aMW, color="Forecast"),size=1) +
+      geom_line(data=testmonframe, aes(x=month(Month), y=Hal_aMW, color="Actual")) +
+      geom_line(data=n.histmonframe, aes(x=Month, y=Halsey_aMW.n2, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Hal_aMW)) +
+      labs(title="Halsey aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Camas
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=Camas_aMW, color="Forecast"),size=1) +
+      geom_line(data=testmonframe, aes(x=month(Month), y=Camas_aMW, color="Actual")) +
+      geom_line(data=n.histmonframe, aes(x=Month, y=Camas_aMW.n2, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Camas_aMW)) +
+      labs(title="Camas Energy Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Biorefinery
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=Bio_aMW, color="Forecast"),size=1) +
+      geom_line(data=testmonframe, aes(x=month(Month), y=Bio_aMW, color="Actual")) +
+      #geom_line(data=n.histmonframe, aes(x=Month, y=Biorefinery_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      labs(title="Biorefinery aMW Comparison", x="Month", y="MW") +
+      theme_bw()
+
+#System
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=System_aMW, color="Forecast"),size=1) +
+      geom_line(data=testmonframe, aes(x=month(Month), y=System_aMW, color="Actual")) +
+      geom_line(data=n.histmonframe, aes(x=Month, y=System_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      labs(title="System Energy Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Total
+ggplot() +
+      geom_line(data=fcstmonframe[fcstmonframe$Month<floor_date(Sys.Date(), unit="months"),], aes(x=month(Month), y=Total_aMW, color="Forecast"),size=1) +
+      geom_line(data=testmonframe, aes(x=month(Month), y=Total_aMW, color="Actual")) +
+      geom_line(data=n.histmonframe, aes(x=Month, y=Total_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      labs(title="Total aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+```
+
+#Monthly EE Forecast
+```{r plots5}
+#Energy forecast vs. actual
+
+
+#ResCom
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=rescom.ee_aMW, color="Forecast"),size=1) +
+      labs(title="ResCom aMW Comparison", x="Month", y="aMW") +
+      # scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$rescom_aMW)) +
+      theme_bw()
+
+#Wauna
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=Wau.ee_aMW, color="Forecast"),size=1) +
+      # scale_y_continuous(minor_breaks= NULL, breaks=all_int_breaks(fcstmonframe$Wau_aMW)) + 
+      labs(title="Wauna aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Halsey
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=Hal.ee_aMW, color="Forecast"),size=1) +
+      # scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Hal_aMW)) +
+      labs(title="Halsey aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Camas - ain't none
+# ggplot() +
+#       geom_line(data=fcstmonframe, aes(x=Month, y=Camas.ee_aMW, color="Forecast"),size=1) +
+#       scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Camas_aMW)) +
+#       labs(title="Camas Energy Comparison", x="Month", y="aMW") +
+#       theme_bw()
+
+#Biorefinery N/A
+# ggplot() +
+#       geom_line(data=fcstmonframe, aes(x=Month, y=Bio.ee_aMW, color="Forecast"),size=1) +
+#       labs(title="Biorefinery aMW Comparison", x="Month", y="MW") +
+#       theme_bw()
+
+#System
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=System.ee_aMW, color="Forecast"),size=1) +
+      labs(title="System Energy Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Total
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=Total.ee_aMW, color="Forecast"),size=1) +
+      labs(title="Total aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+```
+#Monthly EE Diff
+```{r plots6}
+#Energy forecast vs. actual
+#WIP - NOT WORKING
+
+#ResCom
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=rescom.ee_aMW, color="Forecast"),size=1) +
+      labs(title="ResCom aMW Comparison", x="Month", y="aMW") +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$rescom_aMW)) +
+      theme_bw()
+
+#Wauna
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=Wau.ee_aMW, color="Forecast"),size=1) +
+      scale_y_continuous(minor_breaks= NULL, breaks=all_int_breaks(fcstmonframe$Wau_aMW)) + 
+      labs(title="Wauna aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Halsey
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=Hal.ee_aMW, color="Forecast"),size=1) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Hal_aMW)) +
+      labs(title="Halsey aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Camas - ain't none
+# ggplot() +
+#       geom_line(data=fcstmonframe, aes(x=Month, y=Camas.ee_aMW, color="Forecast"),size=1) +
+#       scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(fcstmonframe$Camas_aMW)) +
+#       labs(title="Camas Energy Comparison", x="Month", y="aMW") +
+#       theme_bw()
+
+#Biorefinery N/A
+# ggplot() +
+#       geom_line(data=fcstmonframe, aes(x=Month, y=Bio.ee_aMW, color="Forecast"),size=1) +
+#       labs(title="Biorefinery aMW Comparison", x="Month", y="MW") +
+#       theme_bw()
+
+#System
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=System.ee_aMW, color="Forecast"),size=1) +
+      labs(title="System Energy Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+#Total
+ggplot() +
+      geom_line(data=fcstmonframe, aes(x=Month, y=Total.ee_aMW, color="Forecast"),size=1) +
+      labs(title="Total aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+```
+
+
+#Wauna Load_Factor Debug
+```{r lf_debug}
+#Wauna underpredicts peak peak in test year every month >= 6
+
+#Tiff = get a high resolution image
+tiff("test.tiff", units="in", width = 12, height= 12, res=300)
+ggplot() +
+      geom_line(data=factordata, aes(x=MonYr, y=Wauna_LF, color="Actual"),size=2) +
+      geom_line(data=factordata, aes(x=MonYr, y=mean(Wauna_LF), color="Mean"),size=1) +
+      facet_grid(month ~ .) +
+      labs(title="Wauna Load Factor", x="Month", y="Load Factor") +
+      theme_bw()
+dev.off()
+
+#Predition of load factor for test year based on historic normals actually looks amazingly good!
+#Inaccuracy arises from energy forecast?
+
+```
+
+
+#Temperature Plots
+```{r temperature_plots}
+#No clue why this is important
+ggplot(data=histmonframe, aes(x=Month, y=HDD))+
+  geom_line() +
+  geom_smooth(method=lm)
+
+ggplot(data=histmonframe, aes(x=Month, y=CDD))+
+  geom_line() +
+  geom_smooth(method=lm)
+
+
+mean(growth.rate(as.tis(histmonframe$HDD, start=c(2004, 1), freq=12), lag=12, simple=T))
+
+
+mean(growth.rate(as.tis(histmonframe$CDD, start=c(2004, 1), freq=12), lag=12, simple=F))
+
+```
+#Other Testing
+```{r dostuff, include=F}
+
+#Is annual wauna usage predictable based on cdd/hdd?
+summary(lm(Wauna_aMW~HDD+CDD,data=histyrframe)) #Nope.
+
+
+#is annual rescom predictable based on cdd/hdd?
+summary(lm(Res_aMW~HDD+CDD,data=histyrframe)) #HDD, but not very
+
+
+```
+
+
+#LOad Hour Plots
+```{r lh_plots}
+
+#Halsey
+llh.halsey.energy<-ggplot() +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "LLH",], aes(x=month(Dy), y=Halsey.ff, color="Forecast"),size=1) +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "LLH",], aes(x=month(Dy), y=Halsey, color="Actual"),size=1) +
+      #geom_line(data=n.histmonframe, aes(x=Month, y=Halsey_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(testdata$Halsey)) +
+      labs(title="Halsey LLH aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+hlh.halsey.energy<-ggplot() +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "HLH",], aes(x=month(Dy), y=Halsey.ff, color="Forecast"),size=1) +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "HLH",], aes(x=month(Dy), y=Halsey, color="Actual"),size=1) +
+      #geom_line(data=n.histmonframe, aes(x=Month, y=Halsey_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(testdata$Halsey)) +
+      labs(title="Halsey LLH aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+ggarrange(hlh.halsey.energy, llh.halsey.energy, align = "hv", ncol = 1, nrow = 2)
+
+#Wauna
+hlh.wauna.energy<-ggplot() +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "HLH",], aes(x=month(Dy), y=Wauna.ff, color="Forecast"),size=1) +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "HLH",], aes(x=month(Dy), y=Wauna, color="Actual"),size=1) +
+      #geom_line(data=n.histmonframe, aes(x=Month, y=Halsey_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(testdata$Wauna)) +
+      labs(title="Wauna HLH aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+llh.wauna.energy<-ggplot() +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "LLH",], aes(x=month(Dy), y=Wauna.ff, color="Forecast"),size=1) +
+      geom_line(data=testdata[testdata$Dy<floor_date(Sys.Date(), unit="months") & testdata$Load_hour == "LLH",], aes(x=month(Dy), y=Wauna, color="Actual"),size=1) +
+      #geom_line(data=n.histmonframe, aes(x=Month, y=Halsey_aMW, color="Avg")) +
+      scale_x_continuous(breaks=seq(1:12)) +
+      scale_y_continuous(minor_breaks= NULL,breaks=all_int_breaks(testdata$Wauna)) +
+      labs(title="Wauna LLH aMW Comparison", x="Month", y="aMW") +
+      theme_bw()
+
+ggarrange(hlh.wauna.energy, llh.wauna.energy, align = "hv", ncol = 1, nrow = 2)
+
+```
+
+
+<!-- Things to incorporate in next version -->
+<!-- 1. wauna load factor test graphs -->
+<!-- <!-- 2. separating fcstmonframe into NL and non-NL forecasts --> -->
+<!-- better aMW plots -->
+<!-- finger on scale make sure its consistent, NEXT load-->
+<!-- fix EE graphs -->
